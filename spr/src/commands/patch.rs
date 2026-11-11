@@ -19,7 +19,7 @@
 //! GitHub, and nothing is changed at all if a change and its Pull Request
 //! both have edits the other lacks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::iter::zip;
 
 use git2::Oid;
@@ -28,7 +28,7 @@ use crate::{
     error::{Error, Result},
     github::{PullRequest, PullRequestState},
     jj::short,
-    message::{MessageSection, MessageSectionsMap, build_commit_message, parse_message},
+    message::{MessageSection, MessageSectionsMap, build_commit_message},
     output::output,
     stacks::format_pr_list,
 };
@@ -109,7 +109,7 @@ pub async fn patch(
         .collect();
 
     // Decide everything before changing anything.
-    let linked = linked_changes(jj, config)?;
+    let linked = jj.linked_changes(config)?;
     let mut plans = Vec::new();
     for pr in &pull_requests {
         if pr.state != PullRequestState::Open {
@@ -127,12 +127,17 @@ pub async fn patch(
                 config.remote_name
             )));
         }
-        plans.push(match linked.get(&pr.number) {
+        plans.push(match linked.get(&pr.number).and_then(|l| l.first()) {
             None => Plan::Create,
-            Some(change) => {
-                let commit = jj.get_prepared_commit_for_revision(config, change)?;
+            Some(member) => {
+                // Edits from GitHub go into the top change of the Pull Request.
+                let commit = jj.get_prepared_commit_for_revision(config, &member.change_id)?;
+                let top = linked[&pr.number]
+                    .iter()
+                    .find(|l| l.commit == commit.oid)
+                    .unwrap_or(member);
                 Plan::Existing {
-                    change: change.clone(),
+                    change: top.change_id.clone(),
                     commit_oid: commit.oid,
                     parent_oid: commit.parent_oid,
                     comparison: compare(jj, config, pr, &commit)?,
@@ -437,30 +442,4 @@ fn commit_message(pr: &PullRequest) -> MessageSectionsMap {
         }
     }
     message
-}
-
-/// Map Pull Request numbers to the mutable changes that name them in a
-/// `Pull Request:` trailer.
-fn linked_changes(
-    jj: &crate::jj::Jujutsu,
-    config: &crate::config::Config,
-) -> Result<HashMap<u64, String>> {
-    let listing = jj.run([
-        "log",
-        "--no-graph",
-        "-r",
-        "mutable() & description(substring-i:\"pull request:\")",
-        "-T",
-        "change_id ++ \"\\0\" ++ description ++ \"\\x1e\"",
-    ])?;
-    Ok(listing
-        .split('\x1e')
-        .filter_map(|entry| {
-            let (change, description) = entry.split_once('\0')?;
-            let number = parse_message(description, MessageSection::Title)
-                .get(&MessageSection::PullRequest)
-                .and_then(|field| config.parse_pull_request_field(field))?;
-            Some((number, change.trim().to_string()))
-        })
-        .collect())
 }

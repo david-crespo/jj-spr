@@ -83,7 +83,7 @@ pub async fn close(
     // changed by the implementation)
     add_error(
         &mut result,
-        jj.rewrite_commit_messages(&mut prepared_commits),
+        jj.rewrite_commit_messages(config, &mut prepared_commits),
     );
 
     result

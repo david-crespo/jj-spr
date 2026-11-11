@@ -139,6 +139,32 @@ impl Config {
         None
     }
 
+    /// The Pull Requests a `Pull Request:` section links, without repeats:
+    /// one for each line that names one. `jj squash` of two changes keeps
+    /// both changes' lines, with the second change's title between them,
+    /// so a section can name the same Pull Request twice.
+    pub fn pull_request_links(&self, field: &str) -> Vec<u64> {
+        let mut links = Vec::new();
+        for number in field
+            .lines()
+            .filter_map(|line| self.parse_pull_request_field(line))
+        {
+            if !links.contains(&number) {
+                links.push(number);
+            }
+        }
+        links
+    }
+
+    /// The Pull Request a `Pull Request:` section links, if it links exactly
+    /// one.
+    pub fn pull_request_number(&self, field: &str) -> Option<u64> {
+        match self.pull_request_links(field)[..] {
+            [number] => Some(number),
+            _ => None,
+        }
+    }
+
     /// A name for a new Pull Request's branch: the prefix and a slug of
     /// `title`, cut to `MAX_SLUG_LEN`, with a number added if the name is in
     /// `taken` (branch names on GitHub and in this repository).
@@ -548,5 +574,22 @@ mod tests {
             gh.parse_pull_request_field("https://github.com/acme/codez/pull/123#abc"),
             Some(123)
         );
+    }
+
+    #[test]
+    fn test_pull_request_number_repeated_by_squash() {
+        let gh = config_factory();
+        let url = "https://github.com/acme/codez/pull/123";
+
+        assert_eq!(gh.pull_request_number(url), Some(123));
+        // `jj squash` keeps both lines, with the second title in between.
+        let squashed = format!("{url}\n\nChange B\n\n{url}");
+        assert_eq!(gh.pull_request_links(&squashed), vec![123]);
+        assert_eq!(gh.pull_request_number(&squashed), Some(123));
+
+        let two = format!("{url}\n\nChange B\n\nhttps://github.com/acme/codez/pull/124");
+        assert_eq!(gh.pull_request_links(&two), vec![123, 124]);
+        assert_eq!(gh.pull_request_number(&two), None);
+        assert_eq!(gh.pull_request_number("see the other one"), None);
     }
 }

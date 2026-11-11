@@ -12,12 +12,12 @@ use crate::{
     github::{
         GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
     },
-    message::{MessageSection, validate_commit_message},
+    message::{MessageSection, build_message, validate_commit_message},
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
 use git2::Oid;
-use indoc::{formatdoc, indoc};
+use indoc::formatdoc;
 
 #[derive(Debug, clap::Parser)]
 pub struct DiffOptions {
@@ -209,15 +209,16 @@ async fn resolve_change(
             jj.get_tree_oid_for_commit(commit.parent_oid)?,
         )
     } else {
-        let index = jj.cherrypick(commit.oid, master_base_oid)?;
-        if index.has_conflicts() {
+        let Some(cherry_pick_tree) =
+            jj.cherry_pick_tree(commit.parent_oid, commit.oid, master_base_oid)?
+        else {
             return Err(Error::new(format!(
                 "Not submitting: {label} cannot be cherry-picked on {}.",
                 config.master_ref.branch_name(),
             )));
-        }
+        };
         (
-            jj.write_index(index)?,
+            cherry_pick_tree,
             jj.get_tree_oid_for_commit(master_base_oid)?,
         )
     };
@@ -310,7 +311,8 @@ pub async fn diff(
     // A conflicted change would be pushed as jj's conflict files.
     let selected = prepared_commits
         .iter()
-        .map(|c| c.oid.to_string())
+        .flat_map(|c| c.member_oids())
+        .map(|oid| oid.to_string())
         .collect::<Vec<_>>()
         .join(" | ");
     let conflicted = jj.conflicted_changes(&selected)?;
@@ -322,8 +324,6 @@ pub async fn diff(
     }
 
     refuse_unreadable_pull_request_lines(jj, config, &prepared_commits)?;
-    let bottom_parent = jj.prepare_commit(config, prepared_commits[0].parent_oid)?;
-    refuse_shared_pull_requests(jj, &bottom_parent, &prepared_commits)?;
 
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
 
@@ -434,6 +434,7 @@ pub async fn diff(
         && prepared_commits[0].parent_oid != master_base_oid
         && !resolved[0].cherry_pick
     {
+        let bottom_parent = jj.prepare_commit(config, prepared_commits[0].parent_oid)?;
         Some(lookup_parent_pull_request(gh, &bottom_parent).await?)
     } else {
         None
@@ -614,7 +615,7 @@ pub async fn diff(
     if !opts.dry_run {
         add_error(
             &mut result,
-            jj.rewrite_commit_messages(prepared_commits.as_mut_slice()),
+            jj.rewrite_commit_messages(config, prepared_commits.as_mut_slice()),
         );
     }
 
@@ -762,6 +763,7 @@ fn refuse_unreadable_pull_request_lines(
 ) -> Result<()> {
     let unreadable: Vec<&crate::jj::PreparedCommit> = commits
         .iter()
+        .flat_map(|c| c.lower.iter().chain([c]))
         .filter(|c| c.pull_request_number.is_none())
         .filter(|c| {
             c.message
@@ -807,54 +809,6 @@ fn refuse_unreadable_pull_request_lines(
             .map(|l| format!("  {l}"))
             .collect::<Vec<_>>()
             .join("\n")
-    )))
-}
-
-/// Refuse when two changes link the same Pull Request: the selected ones,
-/// and the parent of the bottom one (which the bottom Pull Request may
-/// target). `jj split` and `jj duplicate` copy the `Pull Request:` line, and
-/// pushing both copies to one Pull Request would make it its own base.
-fn refuse_shared_pull_requests(
-    jj: &crate::jj::Jujutsu,
-    bottom_parent: &crate::jj::PreparedCommit,
-    commits: &[crate::jj::PreparedCommit],
-) -> Result<()> {
-    let mut linked: Vec<crate::jj::PreparedCommit> = Vec::new();
-    if bottom_parent.pull_request_number.is_some() {
-        linked.push(bottom_parent.clone());
-    }
-    linked.extend(
-        commits
-            .iter()
-            .filter(|c| c.pull_request_number.is_some())
-            .cloned(),
-    );
-    let change_ids = jj.change_ids_for(&linked)?;
-    let mut by_number: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
-    for commit in &linked {
-        let id = change_ids
-            .get(&commit.oid)
-            .map(|id| crate::jj::short(id).to_string())
-            .unwrap_or_else(|| commit.short_id.clone());
-        by_number
-            .entry(commit.pull_request_number.unwrap())
-            .or_default()
-            .push(id);
-    }
-    let shared: Vec<String> = by_number
-        .iter()
-        .filter(|(_, ids)| ids.len() > 1)
-        .map(|(n, ids)| format!("#{n}: {}", ids.join(", ")))
-        .collect();
-    if shared.is_empty() {
-        return Ok(());
-    }
-    Err(Error::new(format!(
-        "Not submitting: more than one change links the same Pull Request \
-         (as after `jj split` or `jj duplicate`):\n{}\nKeep the `Pull Request:` \
-         line on the change that should update it, and remove it from the \
-         others (with `jj describe`); they get Pull Requests of their own.",
-        shared.join("\n")
     )))
 }
 
@@ -1066,24 +1020,35 @@ async fn diff_impl(
         )?;
     }
 
+    // A Pull Request of several changes matches when it has the title and
+    // message of any of them, since changes added on top later keep the
+    // title it was opened with.
     if let Some(ref pull_request) = pull_request
         && !opts.update_message
     {
-        let mut pull_request_updates: PullRequestUpdate = Default::default();
-        pull_request_updates.update_message(pull_request, message);
-
-        if !pull_request_updates.is_empty() {
-            output(
-                "⚠️",
-                indoc!(
-                    "The Pull Request's title/message differ from the \
-                     local commit's message.
-                     Use `spr diff --update-message` to overwrite the \
-                     title and message on GitHub with the local message, \
-                     or `spr amend` to go the other way (rewrite the local \
-                     commit message with what is on GitHub)."
-                ),
-            )?;
+        let matches = |message: &crate::message::MessageSectionsMap| {
+            let mut updates: PullRequestUpdate = Default::default();
+            updates.update_message(pull_request, message);
+            updates.is_empty()
+        };
+        if !matches(message) && !local_commit.lower.iter().any(|m| matches(&m.message)) {
+            let advice = if local_commit.lower.is_empty() {
+                "The Pull Request's title/message differ from the local commit's \
+                 message.\nUse `spr diff --update-message` to overwrite the title and \
+                 message on GitHub with the local message, or `spr amend` to go the \
+                 other way (rewrite the local commit message with what is on GitHub)."
+                    .to_string()
+            } else {
+                // `spr amend` would overwrite the top change's description.
+                format!(
+                    "The Pull Request's title/message differ from the messages of its \
+                     changes.\nUse `spr diff --update-message` to overwrite the title \
+                     and message on GitHub with those of {}, the top of its {} changes.",
+                    local_commit.short_id,
+                    local_commit.lower.len() + 1
+                )
+            };
+            output("⚠️", &advice)?;
         }
     }
 
@@ -1331,29 +1296,6 @@ async fn diff_impl(
         (Some(new_base_branch_commit), Some(base_branch))
     };
 
-    let mut github_commit_message = opts.message.clone();
-    if pull_request.is_some() && github_commit_message.is_none() && !opts.dry_run {
-        let input = {
-            let message_on_prompt = message_on_prompt.clone();
-
-            tokio::task::spawn_blocking(move || {
-                dialoguer::Input::<String>::new()
-                    .with_prompt("Message (leave empty to abort)")
-                    .with_initial_text(message_on_prompt)
-                    .allow_empty(true)
-                    .interact_text()
-            })
-            .await??
-        };
-
-        if input.is_empty() {
-            return Err(Error::new("Aborted as per user request".to_string()));
-        }
-
-        *message_on_prompt = input.clone();
-        github_commit_message = Some(input);
-    }
-
     // Construct the new commit for the Pull Request branch. First parent is the
     // current head commit of the Pull Request (we set this to the master base
     // commit earlier if the Pull Request does not yet exist)
@@ -1407,12 +1349,84 @@ async fn diff_impl(
         }
     }
 
+    // A Pull Request of several changes gets a commit for each change when
+    // its branch has the tree of the base or of one of its changes: one for
+    // each change above that one. Otherwise it gets one commit with the top
+    // change's tree.
+    if !native
+        && !local_commit.lower.is_empty()
+        && pr_commit_parents.len() == 2
+        && is_ancestor(jj, pr_commit_parents[0], pr_commit_parents[1])?
+    {
+        // A new Pull Request on a base branch of its own: the base branch's
+        // commit already contains master.
+        pr_commit_parents.remove(0);
+    }
+    let mut steps = Vec::new();
+    if !local_commit.lower.is_empty()
+        && pr_commit_parents.len() == 1
+        && (!effective_cherry_pick || directly_based_on_master)
+    {
+        let mut trees = vec![new_base_tree];
+        for member in &local_commit.lower {
+            trees.push(jj.get_tree_oid_for_commit(member.oid)?);
+        }
+        trees.push(new_head_tree);
+        // The tree the steps go on.
+        let current = jj.get_tree_oid_for_commit(pr_commit_parents[0])?;
+        if let Some(done) = trees.iter().rposition(|tree| *tree == current) {
+            let members = local_commit.lower.iter().map(|m| (m.oid, &m.message));
+            let members = members.chain([(local_commit.oid, &*message)]);
+            steps = zip(members, &trees[1..])
+                .skip(done)
+                .map(|((oid, message), tree)| {
+                    let text =
+                        build_message(message, &[MessageSection::Title, MessageSection::Summary]);
+                    (oid, text, *tree)
+                })
+                .collect();
+        }
+    }
+
+    let mut github_commit_message = opts.message.clone();
+    if pull_request.is_some()
+        && github_commit_message.is_none()
+        && steps.is_empty()
+        && !opts.dry_run
+    {
+        let input = {
+            let message_on_prompt = message_on_prompt.clone();
+
+            tokio::task::spawn_blocking(move || {
+                dialoguer::Input::<String>::new()
+                    .with_prompt("Message (leave empty to abort)")
+                    .with_initial_text(message_on_prompt)
+                    .allow_empty(true)
+                    .interact_text()
+            })
+            .await??
+        };
+
+        if input.is_empty() {
+            return Err(Error::new("Aborted as per user request".to_string()));
+        }
+
+        *message_on_prompt = input.clone();
+        github_commit_message = Some(input);
+    }
+
     let mut published_number = pull_request.as_ref().map(|pr| pr.number);
 
     // Create the new commit
     let pr_commit = if opts.dry_run {
         // Use a placeholder OID — this won't be pushed
         pr_head_oid
+    } else if !steps.is_empty() {
+        let mut parents = pr_commit_parents;
+        for (oid, text, tree) in steps {
+            parents = vec![jj.create_derived_commit(oid, &text, tree, &parents)?];
+        }
+        parents[0]
     } else {
         jj.create_derived_commit(
             local_commit.oid,

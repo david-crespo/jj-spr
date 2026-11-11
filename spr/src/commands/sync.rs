@@ -54,7 +54,10 @@ enum Status {
 
 struct Change {
     commit: PreparedCommit,
+    /// The change ID of the top change of the Pull Request.
     change_id: String,
+    /// The change IDs of every change of the Pull Request, bottom first.
+    members: Vec<String>,
     status: Status,
     /// The Pull Request's head, from the remote-tracking branch.
     head_oid: Option<Oid>,
@@ -105,13 +108,19 @@ pub async fn sync(
             None => Status::Unsubmitted,
             Some(pull_request) => status_of(jj, config, &commit, &pull_request).await?,
         };
-        let change_id = change_ids
-            .get(&commit.oid)
-            .cloned()
-            .ok_or_else(|| Error::new(format!("could not find the change ID of {}", commit.oid)))?;
+        let members = commit
+            .member_oids()
+            .map(|oid| {
+                change_ids
+                    .get(&oid)
+                    .cloned()
+                    .ok_or_else(|| Error::new(format!("could not find the change ID of {oid}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
         changes.push(Change {
             commit,
-            change_id,
+            change_id: members.last().expect("a Pull Request has a change").clone(),
+            members,
             status,
             head_oid,
         });
@@ -175,7 +184,7 @@ pub async fn sync(
                 "  ",
                 &format!(
                     "Would rebase {} and its descendants onto {trunk}",
-                    short(&root.change_id)
+                    short(&root.members[0])
                 ),
             )?;
         }
@@ -191,19 +200,15 @@ pub async fn sync(
     }
 
     let mut abandon = vec!["abandon".to_string()];
-    abandon.extend(merged.iter().map(|c| c.change_id.clone()));
+    abandon.extend(merged.iter().flat_map(|c| c.members.iter().cloned()));
     jj.run(&abandon)?;
-    output(
-        "🗑️ ",
-        &format!(
-            "Abandoned {}",
-            merged
-                .iter()
-                .map(|c| short(&c.change_id))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    )?;
+    for change in &merged {
+        let Status::Merged(number) = change.status else {
+            continue;
+        };
+        let ids: Vec<&str> = change.members.iter().map(|id| short(id)).collect();
+        output("🗑️ ", &format!("Abandoned {} (#{number})", ids.join(", ")))?;
+    }
 
     if remaining.is_empty() {
         output("🎉", "Every change in this stack has merged.")?;
@@ -250,7 +255,7 @@ fn rebase_onto_newer_main(
             "  ",
             &format!(
                 "Would rebase {} and its descendants onto {trunk}",
-                short(&root.change_id)
+                short(&root.members[0])
             ),
         )?;
         return Ok(());
@@ -266,7 +271,7 @@ fn rebase_onto_main(
     root: &Change,
     count: usize,
 ) -> Result<()> {
-    jj.run(["rebase", "-s", &root.change_id, "-d", trunk])?;
+    jj.run(["rebase", "-s", &root.members[0], "-d", trunk])?;
     output("⤴️ ", &format!("Rebased {count} change(s) onto {trunk}"))
 }
 

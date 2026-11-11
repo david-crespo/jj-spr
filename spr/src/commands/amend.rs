@@ -68,7 +68,7 @@ pub async fn amend(
         }
         failure = validate_commit_message(&commit.message).is_err() || failure;
     }
-    jj.rewrite_commit_messages(&mut pc)?;
+    jj.rewrite_commit_messages(config, &mut pc)?;
 
     if failure { Err(Error::empty()) } else { Ok(()) }
 }

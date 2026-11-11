@@ -53,6 +53,9 @@ pub struct StackOptions {
 struct Row {
     change_id: String,
     title: String,
+    /// The other changes of the Pull Request (change ID and title), bottom
+    /// first.
+    lower: Vec<(String, String)>,
     pull_request: Option<PullRequest>,
     /// Checks and threads, for open Pull Requests.
     status: Option<PullRequestStatus>,
@@ -155,7 +158,21 @@ pub async fn stack(
             _ => false,
         };
 
+        let lower = commit
+            .lower
+            .iter()
+            .map(|member| {
+                let change_id = change_ids.get(&member.oid).cloned().unwrap_or_default();
+                let title = member
+                    .message
+                    .get(&MessageSection::Title)
+                    .cloned()
+                    .unwrap_or_else(|| "(no title)".to_string());
+                (change_id, title)
+            })
+            .collect();
         rows.push(Row {
+            lower,
             reviewed: ReviewedChange {
                 label: format!("{} {}", short(&change_id), title),
                 pr: reviewed_pr,
@@ -426,6 +443,14 @@ fn print_rows(rows: &[Row], trunk: &str, verbose: bool) -> Result<()> {
                 term.write_line(&format!("│    {line}"))?;
             }
         }
+        // The other changes of the same Pull Request, without its columns.
+        for (change_id, title) in row.lower.iter().rev() {
+            term.write_line(&format!(
+                "○  {}  {}",
+                console::style(short(change_id)).magenta(),
+                truncate_str(title, TITLE_WIDTH, "…"),
+            ))?;
+        }
     }
     term.write_line(&format!("◆  {trunk}"))?;
     Ok(())
@@ -584,6 +609,10 @@ fn print_json(
             json!({
                 "change_id": row.change_id,
                 "title": row.title,
+                "lower_changes": row.lower.iter().map(|(change_id, title)| json!({
+                    "change_id": change_id,
+                    "title": title,
+                })).collect::<Vec<_>>(),
                 "pull_request": pull_request,
             })
         })

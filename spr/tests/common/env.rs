@@ -317,6 +317,18 @@ impl TestEnv {
             .is_empty()
     }
 
+    /// The tree of a local change.
+    pub fn tree_of(&self, change: &str) -> String {
+        let commit = self.commit_id(change);
+        let outcome = run_command(
+            &self.work,
+            &self.env,
+            "git",
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        outcome.text.trim().to_string()
+    }
+
     /// The commit ID of a change's parent.
     pub fn parent_of(&self, change: &str) -> String {
         self.commit_id(&format!("{change}-"))

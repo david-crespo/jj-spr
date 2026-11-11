@@ -44,6 +44,31 @@ pub struct PreparedCommit {
     pub pull_request_number: Option<u64>,
     pub message_changed: bool,
     pub dry_run_action: Option<DryRunAction>,
+    /// The other changes of the same Pull Request, bottom first. A Pull
+    /// Request is a run of adjacent changes that link it; it is prepared as
+    /// one commit whose `oid` and `message` are its top change's, and whose
+    /// `parent_oid` is the parent of its bottom change. Empty for a Pull
+    /// Request of one change.
+    pub lower: Vec<PreparedCommit>,
+}
+
+impl PreparedCommit {
+    /// The bottom change of the Pull Request.
+    pub fn bottom_oid(&self) -> Oid {
+        self.lower.first().map_or(self.oid, |c| c.oid)
+    }
+
+    /// Every change of the Pull Request, bottom first.
+    pub fn member_oids(&self) -> impl Iterator<Item = Oid> + '_ {
+        self.lower.iter().map(|c| c.oid).chain([self.oid])
+    }
+}
+
+/// A mutable change that links a Pull Request in its description.
+#[derive(Debug, Clone)]
+pub struct LinkedChange {
+    pub commit: Oid,
+    pub change_id: String,
 }
 
 pub struct Jujutsu {
@@ -78,7 +103,9 @@ impl Jujutsu {
         revision: &str,
     ) -> Result<PreparedCommit> {
         let commit_oid = self.resolve_revision_to_commit_id(revision)?;
-        self.prepare_commit(config, commit_oid)
+        let commit = self.prepare_commit(config, commit_oid)?;
+        let mut grouped = self.group_pull_requests(config, vec![commit])?;
+        Ok(grouped.remove(0))
     }
 
     pub fn get_master_base_for_commit(&self, config: &Config, commit_oid: Oid) -> Result<Oid> {
@@ -98,13 +125,19 @@ impl Jujutsu {
         to_revision: &str,
         is_inclusive: bool,
     ) -> Result<Vec<PreparedCommit>> {
-        // Get commit range using jj
         let operator = if is_inclusive { "::" } else { ".." };
+        let commits =
+            self.prepare_revset(config, &format!("{from_revision}{operator}{to_revision}"))?;
+        self.group_pull_requests(config, commits)
+    }
+
+    /// Prepare each commit of `revset` on its own, bottom first.
+    fn prepare_revset(&self, config: &Config, revset: &str) -> Result<Vec<PreparedCommit>> {
         let output = self.run([
             "log",
             "--no-graph",
             "-r",
-            &format!("{}{}{}", from_revision, operator, to_revision),
+            revset,
             "--template",
             "commit_id ++ \"\\n\"",
         ])?;
@@ -123,6 +156,157 @@ impl Jujutsu {
         commits.reverse();
 
         Ok(commits)
+    }
+
+    /// Group `commits` (bottom first, each prepared on its own) into Pull
+    /// Requests: each run of adjacent changes that link the same Pull
+    /// Request becomes one `PreparedCommit` (see `PreparedCommit::lower`).
+    /// A selection that includes part of a run is widened to the whole run.
+    /// Changes that link one Pull Request but are not one run are refused.
+    pub fn group_pull_requests(
+        &self,
+        config: &Config,
+        mut commits: Vec<PreparedCommit>,
+    ) -> Result<Vec<PreparedCommit>> {
+        if commits.is_empty() {
+            return Ok(commits);
+        }
+        for (number, linked) in self.linked_changes(config)? {
+            if linked.len() < 2 {
+                continue;
+            }
+            // Only a Pull Request the selection touches matters: one of its
+            // changes is selected, or a selected change sits on one (it may
+            // be between two of them). Changes elsewhere that link it
+            // wrongly, like a `jj duplicate`, are refused only when selected.
+            let linked_selected = linked
+                .iter()
+                .any(|l| commits.iter().any(|c| c.oid == l.commit));
+            let on_linked = commits
+                .iter()
+                .any(|c| linked.iter().any(|l| l.commit == c.parent_oid));
+            if !linked_selected && !on_linked {
+                continue;
+            }
+            let run = match self.run_of(config, number, &linked) {
+                Ok(run) => run,
+                Err(error) if linked_selected => return Err(error),
+                Err(_) => continue,
+            };
+            let in_run = |c: &PreparedCommit| run.iter().any(|r| r.oid == c.oid);
+            if !commits.iter().any(in_run) {
+                continue;
+            }
+            // Widen the selection at either end to the whole run.
+            let first = run.iter().position(|r| r.oid == commits[0].oid);
+            let last = run
+                .iter()
+                .position(|r| Some(r.oid) == commits.last().map(|c| c.oid));
+            if let Some(first) = first {
+                commits.splice(0..0, run[..first].iter().cloned());
+            }
+            if let Some(last) = last {
+                commits.extend(run[last + 1..].iter().cloned());
+            }
+            if !run.iter().all(|r| commits.iter().any(|c| c.oid == r.oid)) {
+                return Err(Error::new(format!(
+                    "Pull Request #{number} is several changes, and only some of them \
+                     are selected. Select all of them, or none."
+                )));
+            }
+        }
+
+        let grouped = join_runs(commits);
+        let mut seen = std::collections::HashSet::new();
+        for commit in &grouped {
+            if let Some(number) = commit.pull_request_number
+                && !seen.insert(number)
+            {
+                return Err(Error::new(format!(
+                    "Pull Request #{number} is linked from changes that are not one run \
+                     of adjacent changes. Keep the `Pull Request:` line only on the \
+                     changes that make up the Pull Request, and remove it from the others \
+                     (with `jj describe`); they get Pull Requests of their own."
+                )));
+            }
+        }
+        Ok(grouped)
+    }
+
+    /// The run of changes that make up Pull Request `number`, bottom first:
+    /// the changes that link it, and any changes without a Pull Request
+    /// between them. Refused unless that is one line of changes with no
+    /// other Pull Request in it.
+    fn run_of(
+        &self,
+        config: &Config,
+        number: u64,
+        linked: &[LinkedChange],
+    ) -> Result<Vec<PreparedCommit>> {
+        let ids = linked
+            .iter()
+            .map(|l| l.commit.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let run = self.prepare_revset(config, &format!("roots({ids})::heads({ids})"))?;
+        let is_line = run.windows(2).all(|pair| pair[1].parent_oid == pair[0].oid);
+        let one_pull_request = run
+            .iter()
+            .all(|c| c.pull_request_number.is_none_or(|n| n == number));
+        let has_all = linked.iter().all(|l| run.iter().any(|c| c.oid == l.commit));
+        if is_line && one_pull_request && has_all {
+            return Ok(run);
+        }
+        Err(Error::new(format!(
+            "Pull Request #{number} is linked from changes that are not one run of \
+             adjacent changes: {}. Keep the `Pull Request:` line only on the changes \
+             that make up the Pull Request, and remove it from the others (with \
+             `jj describe`); they get Pull Requests of their own.",
+            linked
+                .iter()
+                .map(|l| short(&l.change_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
+    /// The mutable changes that link each Pull Request in a `Pull Request:`
+    /// line.
+    pub fn linked_changes(
+        &self,
+        config: &Config,
+    ) -> Result<std::collections::BTreeMap<u64, Vec<LinkedChange>>> {
+        let listing = self.run([
+            "log",
+            "--no-graph",
+            "-r",
+            "mutable() & description(substring-i:\"pull request:\")",
+            "-T",
+            "commit_id ++ \" \" ++ change_id ++ \"\\0\" ++ description ++ \"\\x1e\"",
+        ])?;
+        let mut linked: std::collections::BTreeMap<u64, Vec<LinkedChange>> = Default::default();
+        for entry in listing.split('\x1e') {
+            let Some((ids, description)) = entry.split_once('\0') else {
+                continue;
+            };
+            let Some((commit, change_id)) = ids.trim().split_once(' ') else {
+                continue;
+            };
+            let Ok(commit) = Oid::from_str(commit) else {
+                continue;
+            };
+            let Some(number) = parse_message(description, MessageSection::Title)
+                .get(&MessageSection::PullRequest)
+                .and_then(|field| config.pull_request_number(field))
+            else {
+                continue;
+            };
+            linked.entry(number).or_default().push(LinkedChange {
+                commit,
+                change_id: change_id.to_string(),
+            });
+        }
+        Ok(linked)
     }
 
     pub fn check_no_uncommitted_changes(&self) -> Result<()> {
@@ -252,68 +436,73 @@ impl Jujutsu {
         Ok(Some(merged.write_tree_to(repo)?))
     }
 
-    pub fn cherrypick(&self, commit_oid: Oid, onto_oid: Oid) -> Result<git2::Index> {
-        let commit = self.git_repo.find_commit(commit_oid)?;
-        let onto_commit = self.git_repo.find_commit(onto_oid)?;
-        let _commit_tree = commit.tree()?;
-        let _onto_tree = onto_commit.tree()?;
-        let _base_tree = if commit.parents().count() > 0 {
-            commit.parent(0)?.tree()?
-        } else {
-            // For initial commit, use empty tree
-            let empty_tree_oid = self.git_repo.treebuilder(None)?.write()?;
-            self.git_repo.find_tree(empty_tree_oid)?
-        };
-
-        let index = self.git_repo.cherrypick_commit(
-            &commit,
-            &onto_commit,
-            0,
-            Some(&git2::MergeOptions::new()),
-        )?;
-        Ok(index)
+    /// The changes from `base` to `head` applied to `onto`, as a tree, or
+    /// `None` when they conflict. For a change, `base` is its parent.
+    pub fn cherry_pick_tree(&self, base: Oid, head: Oid, onto: Oid) -> Result<Option<Oid>> {
+        self.merge_trees(
+            self.get_tree_oid_for_commit(base)?,
+            self.get_tree_oid_for_commit(onto)?,
+            self.get_tree_oid_for_commit(head)?,
+        )
     }
 
-    pub fn write_index(&self, mut index: git2::Index) -> Result<Oid> {
-        Ok(index.write_tree_to(&self.git_repo)?)
-    }
-
-    pub fn rewrite_commit_messages(&self, commits: &mut [PreparedCommit]) -> Result<()> {
-        if commits.is_empty() {
-            return Ok(());
-        }
-
-        // Use jj describe to update commit messages, but only for commits that actually changed
+    /// Write changed commit messages back with `jj describe`. The other
+    /// changes of a Pull Request get the top change's `Pull Request:` line,
+    /// or lose theirs when it has none (after `jj spr close`).
+    pub fn rewrite_commit_messages(
+        &self,
+        config: &Config,
+        commits: &mut [PreparedCommit],
+    ) -> Result<()> {
         for prepared_commit in commits.iter_mut() {
-            // Only update commits whose messages were actually modified
-            if !prepared_commit.message_changed {
-                continue;
+            let line = prepared_commit
+                .message
+                .get(&MessageSection::PullRequest)
+                .cloned();
+            let number = line
+                .as_deref()
+                .and_then(|field| config.pull_request_number(field));
+            for member in prepared_commit.lower.iter_mut() {
+                if member.pull_request_number != number {
+                    match &line {
+                        Some(line) => member
+                            .message
+                            .insert(MessageSection::PullRequest, line.clone()),
+                        None => member.message.remove(&MessageSection::PullRequest),
+                    };
+                    member.pull_request_number = number;
+                    member.message_changed = true;
+                }
+                if member.message_changed {
+                    self.describe(member)?;
+                }
             }
-
-            let new_message = build_commit_message(&prepared_commit.message);
-
-            // Get the change ID for this commit
-            let change_id = self.get_change_id_for_commit(prepared_commit.oid)?;
-
-            // Update the commit message using jj describe
-            let mut cmd = Command::new(&self.jj_bin);
-            cmd.args(["describe", "-r", &change_id, "-m", &new_message])
-                .current_dir(&self.repo_path)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-
-            let output = cmd.output()?;
-            if !output.status.success() {
-                return Err(Error::new(format!(
-                    "Failed to update commit message: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
+            if prepared_commit.message_changed {
+                self.describe(prepared_commit)?;
             }
-
-            // Reset the flag after successful update
-            prepared_commit.message_changed = false;
         }
+        Ok(())
+    }
 
+    /// `jj describe` a commit with its prepared message.
+    fn describe(&self, prepared_commit: &mut PreparedCommit) -> Result<()> {
+        let new_message = build_commit_message(&prepared_commit.message);
+        let change_id = self.get_change_id_for_commit(prepared_commit.oid)?;
+
+        let mut cmd = Command::new(&self.jj_bin);
+        cmd.args(["describe", "-r", &change_id, "-m", &new_message])
+            .current_dir(&self.repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = cmd.output()?;
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "Failed to update commit message: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        prepared_commit.message_changed = false;
         Ok(())
     }
 
@@ -333,7 +522,7 @@ impl Jujutsu {
 
         let pull_request_number = message
             .get(&MessageSection::PullRequest)
-            .and_then(|url| config.parse_pull_request_field(url));
+            .and_then(|field| config.pull_request_number(field));
 
         Ok(PreparedCommit {
             oid: commit_oid,
@@ -343,6 +532,7 @@ impl Jujutsu {
             pull_request_number,
             message_changed: false,
             dry_run_action: None,
+            lower: Vec::new(),
         })
     }
 
@@ -383,18 +573,24 @@ impl Jujutsu {
     /// each with a single parent. `what` names the command, for the error.
     pub fn require_linear(&self, commits: &[PreparedCommit], what: &str) -> Result<()> {
         for (i, commit) in commits.iter().enumerate() {
-            let parents = self.git_repo.find_commit(commit.oid)?.parent_count();
-            let follows_previous = i == 0 || commit.parent_oid == commits[i - 1].oid;
-            if parents != 1 || !follows_previous {
+            // Every change of a Pull Request, not only its top.
+            for member in commit.lower.iter().chain([commit]) {
+                if self.git_repo.find_commit(member.oid)?.parent_count() != 1 {
+                    return Err(Error::new(format!(
+                        "Not {what}: the changes up to the target are not a single \
+                         line of changes ({} is a merge). Pass `-r <top of one \
+                         stack>` to pick one stack.",
+                        member.short_id,
+                    )));
+                }
+            }
+            if i > 0 && commit.parent_oid != commits[i - 1].oid {
                 return Err(Error::new(format!(
                     "Not {what}: the changes up to the target are not a single line of \
-                     changes ({} {}). Pass `-r <top of one stack>` to pick one stack.",
-                    commit.short_id,
-                    if parents != 1 {
-                        "is a merge"
-                    } else {
-                        "is on a separate branch"
-                    }
+                     changes ({} is on a separate branch). Pass `-r <top of one \
+                     stack>` to pick one stack.",
+                    // The bottom change is the one whose parent is elsewhere.
+                    commit.lower.first().unwrap_or(commit).short_id,
                 )));
             }
         }
@@ -559,7 +755,8 @@ impl Jujutsu {
         }
         let revset = commits
             .iter()
-            .map(|c| c.oid.to_string())
+            .flat_map(|c| c.member_oids())
+            .map(|oid| oid.to_string())
             .collect::<Vec<_>>()
             .join(" | ");
         let listing = self.run([
@@ -611,6 +808,45 @@ impl Jujutsu {
             )))
         }
     }
+}
+
+/// Join each run of adjacent changes (bottom first) that link the same Pull
+/// Request into one `PreparedCommit`. A change without a Pull Request
+/// between two changes of the same one joins it.
+fn join_runs(commits: Vec<PreparedCommit>) -> Vec<PreparedCommit> {
+    let mut joined: Vec<PreparedCommit> = Vec::new();
+    // Changes without a Pull Request, after the last one that has one.
+    let mut unlinked: Vec<PreparedCommit> = Vec::new();
+    for commit in commits {
+        let Some(number) = commit.pull_request_number else {
+            unlinked.push(commit);
+            continue;
+        };
+        let continues_run = joined.last().is_some_and(|last| {
+            let chain = std::iter::once(last.oid).chain(unlinked.iter().map(|c| c.oid));
+            let parents = unlinked
+                .iter()
+                .map(|c| c.parent_oid)
+                .chain([commit.parent_oid]);
+            last.pull_request_number == Some(number) && chain.eq(parents)
+        });
+        if continues_run {
+            let mut run = joined.pop().expect("checked above");
+            let base = run.parent_oid;
+            let mut lower = std::mem::take(&mut run.lower);
+            lower.push(run);
+            lower.append(&mut unlinked);
+            let mut top = commit;
+            top.parent_oid = base;
+            top.lower = lower;
+            joined.push(top);
+        } else {
+            joined.append(&mut unlinked);
+            joined.push(commit);
+        }
+    }
+    joined.append(&mut unlinked);
+    joined
 }
 
 /// The first eight characters of a change ID, for messages.
