@@ -12,7 +12,7 @@ use crate::{
     github::{
         GitHub, PullRequest, PullRequestRequestReviewers, PullRequestState, PullRequestUpdate,
     },
-    message::{MessageSection, build_message, validate_commit_message},
+    message::{MessageSection, build_github_body, build_message, validate_commit_message},
     output::{output, write_commit_title},
     utils::{parse_name_list, remove_all_parens, run_command},
 };
@@ -29,6 +29,19 @@ pub struct DiffOptions {
     /// commit message
     #[clap(long)]
     update_message: bool,
+
+    /// Title for the Pull Request on GitHub, in place of the top change's.
+    /// It replaces the title of an existing Pull Request. Local descriptions
+    /// are not changed. Only for a run with one Pull Request.
+    #[clap(long, value_name = "TEXT", value_parser = non_blank, conflicts_with = "update_message")]
+    title: Option<String>,
+
+    /// Body for the Pull Request on GitHub, in place of the top change's
+    /// description. It replaces the body of an existing Pull Request, and an
+    /// empty one means an empty body. Local descriptions are not changed.
+    /// Only for a run with one Pull Request.
+    #[clap(long, value_name = "TEXT", conflicts_with = "update_message")]
+    body: Option<String>,
 
     /// Submit any new Pull Request as a draft
     #[clap(long)]
@@ -80,6 +93,29 @@ pub struct DiffOptions {
     /// history but disappear from the Pull Request's diff.
     #[clap(long)]
     discard_remote_changes: bool,
+
+    /// Submit the selected range of changes as one Pull Request, with a
+    /// commit for each change. The changes stay separate locally, and each
+    /// gets the Pull Request's `Pull Request:` line. A new Pull Request takes
+    /// its title and message from the top change.
+    #[clap(long)]
+    one_pr: bool,
+
+    /// Submit the changes from the base up to the topmost of these as one
+    /// Pull Request per tip, each made of the changes above the tip below it
+    /// and up to its own, as with --one-pr. The tips have to be in a line.
+    /// Each Pull Request already in the range needs a tip of its own: its
+    /// top change, or a new change above it.
+    #[clap(long, value_name = "REVSET", conflicts_with_all = ["revision", "all", "one_pr"])]
+    tips: Option<String>,
+}
+
+fn non_blank(text: &str) -> std::result::Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("it is empty".to_string());
+    }
+    Ok(text.to_string())
 }
 
 /// The Pull Request branch of a change's parent, which a natively stacked
@@ -116,6 +152,27 @@ struct Resolved {
     base_tree: Oid,
     /// The reviewers to request for a new Pull Request.
     reviewers: PullRequestRequestReviewers,
+}
+
+/// The changes of a `--tips` revset and the topmost of them. They have to be
+/// in a line, each an ancestor of the topmost.
+fn resolve_tips(jj: &crate::jj::Jujutsu, revset: &str) -> Result<(Oid, Vec<Oid>)> {
+    let tips = jj.commit_ids(revset)?;
+    match jj.commit_ids(&format!("heads({revset})"))?[..] {
+        [topmost] => Ok((topmost, tips)),
+        [] => Err(Error::new(format!(
+            "Not submitting: --tips '{revset}' has no changes."
+        ))),
+        ref heads => Err(Error::new(format!(
+            "Not submitting: the tips have to be in a line, each an ancestor of the \
+             topmost, but {} are on separate branches.",
+            heads
+                .iter()
+                .map(|oid| format!("{oid:.7}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
 }
 
 /// `ancestor` is `descendant` or one of its ancestors.
@@ -178,8 +235,9 @@ fn resolve_cherry_pick(
 }
 
 /// Work out what `diff_impl` needs for one change, failing for a missing
-/// title, a cherry-pick that conflicts, or an unknown reviewer. `diff` does
-/// this for every change before it changes anything on GitHub.
+/// title or description, a cherry-pick that conflicts, or an unknown
+/// reviewer. `diff` does this for every change before it changes anything on
+/// GitHub.
 async fn resolve_change(
     opts: &DiffOptions,
     jj: &crate::jj::Jujutsu,
@@ -196,6 +254,33 @@ async fn resolve_change(
             .map(String::as_str)
             .unwrap_or("(no title)")
     );
+
+    // Each change of a Pull Request of several changes can become a commit on
+    // its branch, with the change's description as the message.
+    let undescribed: Vec<&str> = commit
+        .lower
+        .iter()
+        .filter(|m| {
+            m.message
+                .get(&MessageSection::Title)
+                .is_none_or(|title| title.trim().is_empty())
+        })
+        .map(|m| m.short_id.as_str())
+        .collect();
+    if !undescribed.is_empty() {
+        return Err(Error::new(format!(
+            "Not submitting: {} {} no description, and each change of a Pull \
+             Request of several changes becomes a commit on its branch. Describe \
+             them with `jj describe`.",
+            undescribed.join(", "),
+            if undescribed.len() == 1 {
+                "has"
+            } else {
+                "have"
+            },
+        )));
+    }
+
     let mut message = commit.message.clone();
     let (cherry_pick, mut message_changed) =
         resolve_cherry_pick(opts.cherry_pick, opts.no_cherry_pick, &mut message);
@@ -282,11 +367,20 @@ pub async fn diff(
 ) -> Result<()> {
     let mut result = Ok(());
 
+    // With --tips, the range runs from the base up to the topmost tip, as
+    // with --all.
+    let tips = opts
+        .tips
+        .as_deref()
+        .map(|revset| resolve_tips(jj, revset))
+        .transpose()?;
+    let topmost_tip = tips.as_ref().map(|(topmost, _)| topmost.to_string());
+
     // Determine revision and whether to use range mode
     let (use_range_mode, base_rev, target_rev, is_inclusive) =
         crate::revision_utils::parse_revision_and_range(
-            opts.revision.as_deref(),
-            opts.all,
+            topmost_tip.as_deref().or(opts.revision.as_deref()),
+            opts.all || tips.is_some(),
             opts.base.as_deref(),
         )?;
 
@@ -298,6 +392,25 @@ pub async fn diff(
         // Just get the single specified revision
         vec![jj.get_prepared_commit_for_revision(config, &target_rev)?]
     };
+    if opts.one_pr && !use_range_mode {
+        return Err(Error::new(
+            "--one-pr needs a range of changes, like `-r A::C` or `--all`.".to_string(),
+        ));
+    }
+    let tips = match tips {
+        Some((_, tips)) => tips,
+        // One Pull Request is the whole selection, cut after its top change.
+        None if opts.one_pr => prepared_commits.last().map(|c| c.oid).into_iter().collect(),
+        None => Vec::new(),
+    };
+    prepared_commits = crate::jj::join_at_tips(prepared_commits, &tips)?;
+    if (opts.title.is_some() || opts.body.is_some()) && prepared_commits.len() > 1 {
+        return Err(Error::new(format!(
+            "Not submitting: --title and --body are for one Pull Request, and this \
+             run has {}. Run `jj spr diff` once per Pull Request.",
+            prepared_commits.len()
+        )));
+    }
 
     // The commit on master that the changes are based on. The bottom change
     // is not directly on it when its parent is outside the selection.
@@ -635,11 +748,13 @@ pub async fn diff(
         )?;
 
         for (idx, pc) in &actions {
-            let title = pc
-                .message
-                .get(&crate::message::MessageSection::Title)
-                .map(|t| &t[..])
-                .unwrap_or("");
+            // With --title, this run has one Pull Request.
+            let title = opts.title.as_deref().unwrap_or_else(|| {
+                pc.message
+                    .get(&crate::message::MessageSection::Title)
+                    .map(|t| &t[..])
+                    .unwrap_or("")
+            });
             let pos = idx + 1;
 
             let (action_label, base, head, reviewers_list) = match &pc.dry_run_action {
@@ -979,6 +1094,31 @@ async fn register_native_stacks(
     Ok(())
 }
 
+/// What a run changes in an existing Pull Request's title and body: the ones
+/// given with --title and --body, or with --update-message, the local
+/// description's.
+fn title_and_body_updates(
+    opts: &DiffOptions,
+    pull_request: &PullRequest,
+    message: &crate::message::MessageSectionsMap,
+) -> PullRequestUpdate {
+    let mut updates = PullRequestUpdate::default();
+    if opts.update_message {
+        updates.update_message(pull_request, message);
+    }
+    if let Some(title) = opts.title.as_ref().filter(|t| **t != pull_request.title) {
+        updates.title = Some(title.clone());
+    }
+    if let Some(body) = opts
+        .body
+        .as_ref()
+        .filter(|b| pull_request.body.as_ref() != Some(b))
+    {
+        updates.body = Some(body.clone());
+    }
+    updates
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn diff_impl(
     opts: &DiffOptions,
@@ -1022,9 +1162,12 @@ async fn diff_impl(
 
     // A Pull Request of several changes matches when it has the title and
     // message of any of them, since changes added on top later keep the
-    // title it was opened with.
+    // title it was opened with. A run that sets the title or body has no
+    // need for the warning.
     if let Some(ref pull_request) = pull_request
         && !opts.update_message
+        && opts.title.is_none()
+        && opts.body.is_none()
     {
         let matches = |message: &crate::message::MessageSectionsMap| {
             let mut updates: PullRequestUpdate = Default::default();
@@ -1059,11 +1202,12 @@ async fn diff_impl(
         .get(&MessageSection::Title)
         .map(|t| &t[..])
         .unwrap_or("");
+    let pr_title = opts.title.as_deref().unwrap_or(title);
 
     let pull_request_branch = match &pull_request {
         Some(pr) => pr.head.clone(),
         None => {
-            let name = config.get_new_branch_name(taken_branches, title);
+            let name = config.get_new_branch_name(taken_branches, pr_title);
             taken_branches.insert(name.clone());
             config.new_github_branch(&name)
         }
@@ -1129,25 +1273,17 @@ async fn diff_impl(
             // Request branch and base are all the right ones.
             output("✅", "No update necessary")?;
 
-            if opts.update_message {
-                // However, the user requested to update the commit message on
-                // GitHub
-
-                let mut pull_request_updates: PullRequestUpdate = Default::default();
-                pull_request_updates.update_message(pull_request, message);
-
-                if !pull_request_updates.is_empty() {
-                    if opts.dry_run {
-                        output(
-                            "  ",
-                            &format!("Would update PR #{} title/body", pull_request.number),
-                        )?;
-                    } else {
-                        // ...and there are actual changes to the message
-                        gh.update_pull_request(pull_request.number, pull_request_updates)
-                            .await?;
-                        output("✍", "Updated commit message on GitHub")?;
-                    }
+            let pull_request_updates = title_and_body_updates(opts, pull_request, message);
+            if !pull_request_updates.is_empty() {
+                if opts.dry_run {
+                    output(
+                        "  ",
+                        &format!("Would update PR #{} title/body", pull_request.number),
+                    )?;
+                } else {
+                    gh.update_pull_request(pull_request.number, pull_request_updates)
+                        .await?;
+                    output("✍", "Updated commit message on GitHub")?;
                 }
             }
 
@@ -1290,7 +1426,8 @@ async fn diff_impl(
         let base_branch = if let Some(base_branch) = base_branch {
             base_branch
         } else {
-            config.new_github_branch(&config.get_base_branch_name(&jj.get_all_ref_names()?, title))
+            config
+                .new_github_branch(&config.get_base_branch_name(&jj.get_all_ref_names()?, pr_title))
         };
 
         (Some(new_base_branch_commit), Some(base_branch))
@@ -1498,11 +1635,7 @@ async fn diff_impl(
             }
 
             // Things we want to update in the Pull Request on GitHub
-            let mut pull_request_updates: PullRequestUpdate = Default::default();
-
-            if opts.update_message {
-                pull_request_updates.update_message(&pull_request, message);
-            }
+            let mut pull_request_updates = title_and_body_updates(opts, &pull_request, message);
 
             if let Some(ref base_branch) = base_branch {
                 // We are using a base branch.
@@ -1582,7 +1715,10 @@ async fn diff_impl(
             // Then call GitHub to create the Pull Request.
             let pull_request_number = gh
                 .create_pull_request(
-                    message,
+                    pr_title,
+                    opts.body
+                        .clone()
+                        .unwrap_or_else(|| build_github_body(message)),
                     base_branch
                         .as_ref()
                         .unwrap_or(&config.master_ref)
@@ -1724,6 +1860,8 @@ mod tests {
         let opts = DiffOptions {
             all: false,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1734,6 +1872,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert!(!opts.all);
@@ -1749,6 +1889,8 @@ mod tests {
         let opts = DiffOptions {
             all: true,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1759,6 +1901,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert_eq!(opts.base, Some("main".to_string()));
@@ -1779,6 +1923,8 @@ mod tests {
         let opts_with_base = DiffOptions {
             all: true,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1789,6 +1935,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert_eq!(opts_with_base.base.as_deref(), Some("main"));
@@ -1797,6 +1945,8 @@ mod tests {
         let opts_with_trunk = DiffOptions {
             all: true,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1807,6 +1957,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert_eq!(opts_with_trunk.base.as_deref(), Some("trunk()"));
@@ -1817,6 +1969,8 @@ mod tests {
         let opts_with_all = DiffOptions {
             all: true,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1827,6 +1981,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         // When --all is specified, it should work with base revisions
@@ -1840,6 +1996,8 @@ mod tests {
         let opts = DiffOptions {
             all: true,
             update_message: true,
+            title: None,
+            body: None,
             draft: true,
             message: Some("Update message".to_string()),
             cherry_pick: false,
@@ -1850,6 +2008,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert!(opts.all);
@@ -1865,6 +2025,8 @@ mod tests {
         let opts = DiffOptions {
             all: false,
             update_message: false,
+            title: None,
+            body: None,
             draft: false,
             message: None,
             cherry_pick: false,
@@ -1875,6 +2037,8 @@ mod tests {
             native_stack: false,
             no_native_stack: false,
             discard_remote_changes: false,
+            one_pr: false,
+            tips: None,
         };
 
         assert!(opts.dry_run);
@@ -1978,6 +2142,30 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_diff_options_title_and_body() {
+        use clap::Parser;
+        use clap::error::ErrorKind;
+        let kind = |args: &[&str]| {
+            DiffOptions::try_parse_from(["test"].iter().chain(args))
+                .map(|_| ())
+                .map_err(|e| e.kind())
+        };
+        for flag in ["--title", "--body"] {
+            assert_eq!(
+                kind(&[flag, "x", "--update-message"]),
+                Err(ErrorKind::ArgumentConflict)
+            );
+        }
+        for blank in ["", "  "] {
+            assert_eq!(kind(&["--title", blank]), Err(ErrorKind::ValueValidation));
+        }
+        assert_eq!(kind(&["--body", ""]), Ok(()));
+
+        let opts = DiffOptions::try_parse_from(["test", "--title", " Title "]).unwrap();
+        assert_eq!(opts.title.as_deref(), Some("Title"));
     }
 
     // Integration tests would require more complex setup with actual Git repositories

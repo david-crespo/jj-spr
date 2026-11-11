@@ -431,21 +431,16 @@ impl GitHub {
 
     pub async fn create_pull_request(
         &self,
-        message: &MessageSectionsMap,
+        title: &str,
+        body: String,
         base_ref_name: String,
         head_ref_name: String,
         draft: bool,
     ) -> Result<u64> {
         let number = octocrab::instance()
             .pulls(self.config.owner.clone(), self.config.repo.clone())
-            .create(
-                message
-                    .get(&MessageSection::Title)
-                    .unwrap_or(&String::new()),
-                head_ref_name,
-                base_ref_name,
-            )
-            .body(build_github_body(message))
+            .create(title, head_ref_name, base_ref_name)
+            .body(body)
             .draft(Some(draft))
             .send()
             .await?

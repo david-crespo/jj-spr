@@ -310,6 +310,67 @@ One of the major advantages of Jujutsu is that rebasing your entire stack onto n
    jj spr diff --all
    ```
 
+## One Pull Request from Several Changes
+
+A Pull Request can be made of several adjacent changes. Each one gets the
+same `Pull Request:` line, and the Pull Request branch has a commit for each
+change, so reviewers can read it a step at a time.
+
+```shell
+# Open one PR from the three changes; each keeps its own description locally
+jj spr diff -r 'xyz::abc' --one-pr
+
+# Add new changes on top of it later
+jj spr diff -r 'xyz::@-' --one-pr
+```
+
+The Pull Request's title and message come from its top change. Selecting any
+of its changes (with `-r`, or as the end of a range) selects all of them, and
+`land`, `close`, `sync`, and `stack` treat them as one.
+
+To give the Pull Request a title or body of its own, pass `--title` or
+`--body`:
+
+```shell
+jj spr diff -r 'xyz::abc' --one-pr --title "Extract the HTTP app" --body "$(cat body.md)"
+```
+
+They set the title and body on GitHub, for a new Pull Request or an existing
+one, and leave every local description as it is. Whichever one you leave out
+comes from the top change. They apply to one Pull Request per run,
+so a run that would submit several refuses them: run `jj spr diff` once for
+each. Later runs without them warn that the title and message differ from
+the descriptions; `--update-message` there would replace yours with the top
+change's.
+
+Splitting a submitted change with `jj split` keeps the `Pull Request:` line on
+both halves, so the halves become one Pull Request without `--one-pr`.
+
+When you edit a change below the top, the next `jj spr diff` adds one commit
+with the result, as it does for a Pull Request of one change.
+
+To open a stack of such Pull Requests in one run, pass a revset of the top
+change of each to `--tips`:
+
+```shell
+# Nine changes in a line: a1 a2 a3 b1 b2 b3 c1 c2 c3
+jj spr diff --tips 'a3 | b3 | c3'
+```
+
+This opens three Pull Requests (a1 to a3, b1 to b3, and c1 to c3), stacked
+on each other. `--tips` submits every change from trunk (or `--base`) up to
+the topmost tip, and cuts that range into one Pull Request per tip. The tips
+have to be in a line. Changes above the topmost tip are not submitted.
+
+`--tips` neither splits a Pull Request nor joins two. If the range already
+has Pull Requests, a tip can't be a change below the top of one, and each of
+them needs a tip of its own: its top change, or a new change above it. A new
+change goes into the Pull Request of the first tip at or above it, so with a4
+added above a3,
+`--tips 'a4 | b3 | c3'` adds a4 to the first Pull Request. Afterward, every
+submitted change has a `Pull Request:` line, and later updates only need
+`jj spr diff --all`.
+
 ## Working with Revsets
 
 Jujutsu's revset language makes it easy to work with stacks:

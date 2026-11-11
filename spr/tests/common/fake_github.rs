@@ -803,6 +803,17 @@ impl State {
         self.prs.get_mut(&number).unwrap().last_head_sha = commit;
     }
 
+    /// Open a Pull Request the way someone using GitHub directly would, for
+    /// scenarios that do not start with jj-spr. Returns its number.
+    pub fn open_pr_outside_spr(&mut self, head: &str, base: &str, title: &str) -> u64 {
+        let path = format!("/repos/{}/{}/pulls", self.owner, self.name);
+        let body = serde_json::json!({ "head": head, "base": base, "title": title });
+        match self.route("POST", &path, "", &body) {
+            Ok((_, Some(pr))) => pr["number"].as_u64().unwrap(),
+            _ => panic!("could not open a Pull Request from {head} to {base}"),
+        }
+    }
+
     /// Register a stack the way someone using GitHub directly would.
     pub fn stack_outside_spr(&mut self, members: &[u64]) {
         if self.create_stack(members.to_vec()).is_err() {

@@ -131,8 +131,8 @@ impl Jujutsu {
         self.group_pull_requests(config, commits)
     }
 
-    /// Prepare each commit of `revset` on its own, bottom first.
-    fn prepare_revset(&self, config: &Config, revset: &str) -> Result<Vec<PreparedCommit>> {
+    /// The commits of `revset`, top first, as `jj log` lists them.
+    pub fn commit_ids(&self, revset: &str) -> Result<Vec<Oid>> {
         let output = self.run([
             "log",
             "--no-graph",
@@ -141,20 +141,25 @@ impl Jujutsu {
             "--template",
             "commit_id ++ \"\\n\"",
         ])?;
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                Oid::from_str(line)
+                    .map_err(|e| Error::new(format!("Failed to parse commit ID '{}': {}", line, e)))
+            })
+            .collect()
+    }
 
-        let mut commits = Vec::new();
-        for line in output.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                let commit_oid = Oid::from_str(line).map_err(|e| {
-                    Error::new(format!("Failed to parse commit ID '{}': {}", line, e))
-                })?;
-                commits.push(self.prepare_commit(config, commit_oid)?);
-            }
-        }
-
+    /// Prepare each commit of `revset` on its own, bottom first.
+    fn prepare_revset(&self, config: &Config, revset: &str) -> Result<Vec<PreparedCommit>> {
+        let mut commits = self
+            .commit_ids(revset)?
+            .into_iter()
+            .map(|oid| self.prepare_commit(config, oid))
+            .collect::<Result<Vec<_>>>()?;
         commits.reverse();
-
         Ok(commits)
     }
 
@@ -808,6 +813,108 @@ impl Jujutsu {
             )))
         }
     }
+}
+
+/// Cut a selection of Pull Requests (bottom first, as `group_pull_requests`
+/// returns it) after each one whose top change is in `tips`, and join each
+/// part into one Pull Request, for `jj spr diff --tips` and `--one-pr`.
+/// Every tip has to be the top change of a selected Pull Request. Changes
+/// above the topmost tip are left as they are.
+pub fn join_at_tips(commits: Vec<PreparedCommit>, tips: &[Oid]) -> Result<Vec<PreparedCommit>> {
+    for &tip in tips {
+        if commits.iter().any(|c| c.oid == tip) {
+            continue;
+        }
+        let Some(pr) = commits
+            .iter()
+            .find(|c| c.lower.iter().any(|m| m.oid == tip))
+        else {
+            return Err(Error::new(format!(
+                "Not submitting: tip {tip:.7} is not in the range from the base up to \
+                 the topmost tip."
+            )));
+        };
+        return Err(Error::new(format!(
+            "Not submitting: tip {tip:.7} is below the top change of {}, and a Pull \
+             Request can't be split this way. List its top change, {}, instead.",
+            pr.pull_request_number.map_or_else(
+                || "a Pull Request".to_string(),
+                |n| format!("Pull Request #{n}")
+            ),
+            pr.short_id,
+        )));
+    }
+    let mut joined = Vec::new();
+    let mut part = Vec::new();
+    for commit in commits {
+        let is_tip = tips.contains(&commit.oid);
+        part.push(commit);
+        if is_tip {
+            joined.push(join_into_one(std::mem::take(&mut part))?);
+        }
+    }
+    joined.append(&mut part);
+    Ok(joined)
+}
+
+/// Join a selection of Pull Requests (bottom first, a line of changes) into
+/// one. It is the Pull Request one of them already links, if any; the
+/// changes without its `Pull Request:` line get it when the messages are
+/// rewritten.
+fn join_into_one(mut commits: Vec<PreparedCommit>) -> Result<PreparedCommit> {
+    let top_id = commits
+        .last()
+        .expect("one commit at least")
+        .short_id
+        .clone();
+    let mut numbers: Vec<u64> = commits
+        .iter()
+        .filter_map(|c| c.pull_request_number)
+        .collect();
+    numbers.dedup();
+    if numbers.len() > 1 {
+        return Err(Error::new(format!(
+            "Not submitting: the changes up to {top_id} would become one Pull \
+             Request, but they link {}. To keep those apart, list the top change \
+             of every Pull Request in the range with --tips.",
+            numbers
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if !commits
+        .windows(2)
+        .all(|pair| pair[1].parent_oid == pair[0].oid)
+    {
+        return Err(Error::new(format!(
+            "Not submitting: the changes up to {top_id} are not a line of changes, \
+             each the parent of the next, so they can't become one Pull Request."
+        )));
+    }
+    let link = commits.iter().find_map(|c| {
+        let number = c.pull_request_number?;
+        Some((number, c.message.get(&MessageSection::PullRequest)?.clone()))
+    });
+    let base = commits[0].parent_oid;
+    let mut top = commits.pop().expect("one commit at least");
+    let mut lower = Vec::new();
+    for mut commit in commits {
+        lower.append(&mut commit.lower);
+        lower.push(commit);
+    }
+    lower.append(&mut top.lower);
+    if top.pull_request_number.is_none()
+        && let Some((number, link)) = link
+    {
+        top.message.insert(MessageSection::PullRequest, link);
+        top.pull_request_number = Some(number);
+        top.message_changed = true;
+    }
+    top.parent_oid = base;
+    top.lower = lower;
+    Ok(top)
 }
 
 /// Join each run of adjacent changes (bottom first) that link the same Pull
