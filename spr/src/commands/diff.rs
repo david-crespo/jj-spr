@@ -123,6 +123,30 @@ fn is_ancestor(jj: &crate::jj::Jujutsu, ancestor: Oid, descendant: Oid) -> Resul
     Ok(ancestor == descendant || jj.git_repo.graph_descendant_of(descendant, ancestor)?)
 }
 
+/// The tree that GitHub's rebase of a stacked Pull Request would give the
+/// branch at `head` on a base at `base`: the branch's non-merge commits that
+/// are not in `base`, oldest first, replayed onto `base`. `None` when one of
+/// them conflicts.
+fn replayed_tree(jj: &crate::jj::Jujutsu, head: Oid, base: Oid) -> Result<Option<Oid>> {
+    let repo = &jj.git_repo;
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    walk.push(head)?;
+    walk.hide(base)?;
+    let mut tree = jj.get_tree_oid_for_commit(base)?;
+    for oid in walk {
+        let commit = repo.find_commit(oid?)?;
+        if commit.parent_count() != 1 {
+            continue;
+        }
+        match jj.merge_trees(commit.parent(0)?.tree_id(), tree, commit.tree_id())? {
+            Some(merged) => tree = merged,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(tree))
+}
+
 /// Resolve the effective cherry-pick state from CLI flags and the "Cherry Pick:"
 /// marker on the commit description.
 ///
@@ -303,7 +327,7 @@ pub async fn diff(
 
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
 
-    let pull_requests = gh
+    let mut pull_requests = gh
         .get_pull_requests(prepared_commits.iter().map(|pc| pc.pull_request_number))
         .await?;
 
@@ -456,6 +480,55 @@ pub async fn diff(
                     &format!("Dissolving GitHub stack #{stack} to rebuild it"),
                 )?;
                 gh.unstack(stack).await?;
+            }
+        }
+    }
+
+    // GitHub marks a Pull Request merged once its head is in its base branch.
+    // After a reorder, a Pull Request's new head can contain the old head of
+    // a dependent Pull Request that is updated later: moving C below A and B
+    // puts B's old head (already in C's branch) into A's branch while B still
+    // targets A. Point such a dependent Pull Request at master until its own
+    // update sets its new base.
+    if !opts.dry_run {
+        for i in 0..pull_requests.len() {
+            let Some(branch) = pull_requests[i].as_ref().map(|pr| pr.head.clone()) else {
+                continue;
+            };
+            for j in i + 1..pull_requests.len() {
+                let Some(pr) = pull_requests[j]
+                    .as_ref()
+                    .filter(|pr| pr.base.branch_name() == branch.branch_name())
+                else {
+                    continue;
+                };
+                let mut contained = false;
+                for below in pull_requests[..i].iter().flatten() {
+                    contained |= is_ancestor(jj, pr.head_oid, below.head_oid)?;
+                }
+                if !contained {
+                    continue;
+                }
+                let number = pr.number;
+                output(
+                    "↪️ ",
+                    &format!(
+                        "Pointing #{number} at {} until its update, so that GitHub \
+                         does not mark it merged",
+                        config.master_ref.branch_name()
+                    ),
+                )?;
+                gh.update_pull_request(
+                    number,
+                    PullRequestUpdate {
+                        base: Some(config.master_ref.branch_name().to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                if let Some(pr) = pull_requests[j].as_mut() {
+                    pr.base = config.master_ref.clone();
+                }
             }
         }
     }
@@ -1232,26 +1305,36 @@ async fn diff_impl(
         }
     }
 
-    // In a native stack, GitHub rebases the Pull Requests left after a stacked
-    // merge by replaying their commits and dropping merge commits. An update
-    // that merges in a new parent head and also carries local edits would
-    // lose those edits there, so split it: a merge commit with only the
-    // merged result, then an ordinary commit with the local change's tree.
-    // (If the merge conflicts, keep the single merge commit.)
-    if native
-        && pull_request.is_some()
-        && pr_commit_parents.len() == 2
-        && !opts.dry_run
-        && let Some(merged_tree) = jj.merge_trees(pr_base_tree, pr_head_tree, new_base_tree)?
-        && merged_tree != new_head_tree
-    {
-        let merge_commit = jj.create_derived_commit(
-            local_commit.oid,
-            "[spr] changes introduced through rebase",
-            merged_tree,
-            &pr_commit_parents[..],
-        )?;
-        pr_commit_parents = vec![merge_commit];
+    // In a native stack, GitHub rebases the Pull Requests left after a
+    // stacked merge: it replays the non-merge commits of each branch that are
+    // not on its old base, and drops merge commits. A Pull Request left with
+    // nothing to replay is reset to its base and closed. So an update has to
+    // leave the change in non-merge commits. When the old head is in the new
+    // head, as for a Pull Request that moved above the one that had its
+    // commits, the update goes straight onto the new head. When the new head
+    // is in the old one, it goes onto the old head. A merge would add
+    // nothing in either case. Otherwise the merge commit gets the tree that
+    // replaying the branch's existing non-merge commits onto the new head
+    // would produce. When that tree differs from the local change's, an
+    // ordinary commit on top brings it to the local change's tree. When the
+    // replay conflicts, the update stays one merge commit.
+    if native && pr_commit_parents.len() == 2 && !opts.dry_run {
+        let (old_head, new_head) = (pr_commit_parents[0], pr_commit_parents[1]);
+        if is_ancestor(jj, old_head, new_head)? {
+            pr_commit_parents = vec![new_head];
+        } else if is_ancestor(jj, new_head, old_head)? {
+            pr_commit_parents = vec![old_head];
+        } else if let Some(replayed) = replayed_tree(jj, old_head, new_head)?
+            && replayed != new_head_tree
+        {
+            let merge_commit = jj.create_derived_commit(
+                local_commit.oid,
+                "[spr] changes introduced through rebase",
+                replayed,
+                &pr_commit_parents[..],
+            )?;
+            pr_commit_parents = vec![merge_commit];
+        }
     }
 
     let mut published_number = pull_request.as_ref().map(|pr| pr.number);

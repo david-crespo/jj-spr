@@ -188,6 +188,74 @@ fn reorder() {
     );
 }
 
+/// Submit a, b, and c, reorder them locally to `order` (indexes into a, b,
+/// and c, bottom first), submit again, and land the whole stack. Each Pull
+/// Request has to reach main as its own commit with only its own file.
+fn reorder_and_land(order: [usize; 3]) {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    for pair in order.windows(2) {
+        env.jj(&[
+            "rebase",
+            "-r",
+            &changes[pair[1]],
+            "--insert-after",
+            &changes[pair[0]],
+        ]);
+    }
+    env.jj(&["new", &changes[order[2]]]);
+    env.spr(&["diff", "--all", "-m", "reorder"]);
+    let reordered: Vec<String> = order.iter().map(|&i| changes[i].clone()).collect();
+    env.check_chain(&reordered);
+
+    env.spr(&["land", "-r", &reordered[2], "--yes"]);
+    for &i in &order {
+        let pr = env.pr(prs[i]);
+        assert!(
+            pr.merged_at.is_some(),
+            "PR #{} was not merged ({:?})",
+            prs[i],
+            pr.closed_reason
+        );
+    }
+    let titles = ["Change A", "Change B", "Change C"];
+    let expected: Vec<String> = order
+        .iter()
+        .map(|&i| landed_message(prs[i], titles[i]))
+        .collect();
+    assert_eq!(messages_on_main_since(&env, &main), expected);
+    let files: Vec<String> = env
+        .remote_git(&[
+            "log",
+            "--reverse",
+            "--format=%x00",
+            "--name-only",
+            &format!("{main}..main"),
+        ])
+        .split('\0')
+        .map(|names| names.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|names| !names.is_empty())
+        .collect();
+    let names = ["a.txt", "b.txt", "c.txt"];
+    let expected: Vec<String> = order.iter().map(|&i| names[i].to_string()).collect();
+    assert_eq!(files, expected, "the files of each commit on main");
+}
+
+#[test]
+fn reorder_two_adjacent_pull_requests_and_land() {
+    // B moves above C. B's original commit is then in C's branch, so B's
+    // update has to bring B's change in a commit of its own, or GitHub's
+    // rebase after A merges leaves B with no commits and closes it.
+    reorder_and_land([0, 2, 1]);
+}
+
+#[test]
+fn move_the_top_pull_request_to_the_bottom_and_land() {
+    reorder_and_land([2, 0, 1]);
+}
+
 #[test]
 fn insert_in_middle() {
     let env = TestEnv::new();

@@ -22,10 +22,13 @@
 //!   "update branch" (403)
 //! - after a stacked merge, GitHub rewrites the branches of the remaining
 //!   members: it replays each of their commits onto the new base, keeping
-//!   message and author, and drops merge commits
+//!   message and author, and drops merge commits. A member with no commits
+//!   left to replay is reset to its new base's head and closed.
 //! - a draft cannot be merged: 405 from the ordinary endpoint, and a failed
 //!   merge (400) from `merge-async`
 //! - a PR in the middle of a stack can be closed; the stack still lists it
+//! - a PR whose head becomes part of its base branch (as when a push to the
+//!   base branch brings in the PR's head) is marked merged
 //!
 //! Everything else (closing PRs when their base or head branch is deleted,
 //! squash merges as a three-way merge, "update branch" merging the base into
@@ -277,6 +280,20 @@ impl State {
     /// Apply what GitHub does on its own when branches change.
     fn refresh(&mut self) {
         let heads = self.branches();
+        // GitHub marks a Pull Request merged once its head is in its base
+        // branch, however it got there.
+        let landed: Vec<u64> = self
+            .prs
+            .values()
+            .filter(|pr| pr.is_open())
+            .filter(
+                |pr| match (heads.get(&pr.head_ref), heads.get(&pr.base_ref)) {
+                    (Some(head), Some(base)) => self.is_ancestor(head, base),
+                    _ => false,
+                },
+            )
+            .map(|pr| pr.number)
+            .collect();
         for pr in self.prs.values_mut() {
             if !pr.is_open() {
                 continue;
@@ -290,6 +307,11 @@ impl State {
             } else if !heads.contains_key(&pr.head_ref) {
                 pr.state = "closed".into();
                 pr.closed_reason = Some(format!("head branch {} was deleted", pr.head_ref));
+            } else if landed.contains(&pr.number) {
+                pr.state = "closed".into();
+                pr.merged_at = Some(now());
+                pr.merge_commit_sha = Some(pr.last_head_sha.clone());
+                pr.closed_reason = Some(format!("its head is in {}", pr.base_ref));
             }
         }
     }
@@ -630,7 +652,9 @@ impl State {
 
     /// GitHub rebasing a surviving stack member after a merge below it:
     /// each of the branch's own commits (those not in `old_base`) is
-    /// replayed onto the new base, and merge commits are dropped.
+    /// replayed onto the new base, and merge commits are dropped. A member
+    /// left with no commits gets the new base's head and is closed, as live
+    /// GitHub did with a reordered stack.
     fn rebase_onto(&mut self, number: u64, old_base: &str, new_base_ref: &str) {
         let heads = self.branches();
         let head_ref = self.prs[&number].head_ref.clone();
@@ -638,6 +662,14 @@ impl State {
         let mut tip = heads[new_base_ref].clone();
         let range = format!("{old_base}..{head}");
         let commits = self.git(&["rev-list", "--reverse", "--no-merges", &range]);
+        if commits.is_empty() {
+            self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &tip]);
+            let pr = self.prs.get_mut(&number).unwrap();
+            pr.last_head_sha = tip;
+            pr.state = "closed".into();
+            pr.closed_reason = Some("no commits left after the stack rebase".into());
+            return;
+        }
         for commit in commits.lines() {
             let parent = format!("{commit}^");
             let message = self.git(&["log", "-1", "--format=%B", commit]);
@@ -767,6 +799,13 @@ impl State {
         let commit = self.merge_tree_commit(None, &head, &base, &[&head, &base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &commit]);
         self.prs.get_mut(&number).unwrap().last_head_sha = commit;
+    }
+
+    /// Register a stack the way someone using GitHub directly would.
+    pub fn stack_outside_spr(&mut self, members: &[u64]) {
+        if self.create_stack(members.to_vec()).is_err() {
+            panic!("could not stack {members:?}");
+        }
     }
 
     // -- routing -----------------------------------------------------------
