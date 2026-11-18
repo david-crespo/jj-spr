@@ -116,6 +116,7 @@ impl DiffOptions {
             no_cherry_pick: self.no_cherry_pick,
             dry_run: self.dry_run,
             discard_remote_changes: self.discard_remote_changes,
+            message_only_for_updates: false,
         }
     }
 }
@@ -133,26 +134,22 @@ pub(crate) struct PushOptions {
     pub no_cherry_pick: bool,
     pub dry_run: bool,
     pub discard_remote_changes: bool,
+    /// Use `message` only for commits that update a Pull Request. A new one's
+    /// commit gets its change's title.
+    pub message_only_for_updates: bool,
 }
 
 /// What a front end sets for one Pull Request in place of what `publish`
 /// works out from the top change's description: the title and body the Pull
-/// Request should have on GitHub, and the branch for a new one.
+/// Request should have on GitHub.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Overrides {
     pub title: Option<String>,
     pub body: Option<String>,
-    pub branch: Option<String>,
 }
 
 /// Where `publish` records what it did.
 pub(crate) trait Record {
-    /// The new Pull Request at `index` is about to be pushed to `branch` for
-    /// the first time.
-    fn pushing(&mut self, _index: usize, _branch: &str) -> Result<()> {
-        Ok(())
-    }
-
     /// The Pull Request at `index` was published: created, updated, or
     /// found up to date. `number` is `None` for one that a dry run would
     /// create.
@@ -164,7 +161,9 @@ pub(crate) trait Record {
     ) -> Result<()>;
 
     /// Publishing finished, or stopped at an error.
-    fn finish(&mut self, commits: &mut [crate::jj::PreparedCommit]) -> Result<()>;
+    fn finish(&mut self, _commits: &mut [crate::jj::PreparedCommit]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// `diff`'s record: a `Pull Request:` line in each change of a new Pull
@@ -570,7 +569,6 @@ pub async fn diff(
         Overrides {
             title: opts.title.clone(),
             body: opts.body.clone(),
-            branch: None,
         };
         prepared_commits.len()
     ];
@@ -816,7 +814,6 @@ pub(crate) async fn publish(
             prepared_commit,
             resolved,
             &overrides[index],
-            &mut |branch: &str| record.pushing(index, branch),
             master_base_oid,
             pull_request,
             &mut taken_branches,
@@ -1255,7 +1252,6 @@ async fn diff_impl(
     local_commit: &mut crate::jj::PreparedCommit,
     resolved: Resolved,
     overrides: &Overrides,
-    pushing_new: &mut dyn FnMut(&str) -> Result<()>,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
     taken_branches: &mut HashSet<String>,
@@ -1331,10 +1327,9 @@ async fn diff_impl(
         .unwrap_or("");
     let pr_title = overrides.title.as_deref().unwrap_or(title);
 
-    let pull_request_branch = match (&pull_request, &overrides.branch) {
-        (Some(pr), _) => pr.head.clone(),
-        (None, Some(branch)) => config.new_github_branch(branch),
-        (None, None) => {
+    let pull_request_branch = match &pull_request {
+        Some(pr) => pr.head.clone(),
+        None => {
             let name = config.get_new_branch_name(taken_branches, pr_title);
             taken_branches.insert(name.clone());
             config.new_github_branch(&name)
@@ -1387,40 +1382,48 @@ async fn diff_impl(
     };
 
     // At this point we can check if we can exit early because no update to the
-    // existing Pull Request is necessary
-    if let Some(ref pull_request) = pull_request {
-        // So there is an existing Pull Request...
-        if !needs_merging_master
-            && base_is_expected
-            && pr_head_tree == new_head_tree
-            && pr_base_tree == new_base_tree
-        {
-            // ...and it does not need a rebase, and the trees of both Pull
-            // Request branch and base are all the right ones.
-            output("✅", "No update necessary")?;
+    // existing Pull Request is necessary: it does not need a rebase, and the
+    // trees of both its branch and its base are the right ones.
+    if let Some(ref pull_request) = pull_request
+        && !needs_merging_master
+        && base_is_expected
+        && pr_head_tree == new_head_tree
+        && pr_base_tree == new_base_tree
+    {
+        output("✅", "No update necessary")?;
 
-            let pull_request_updates =
-                title_and_body_updates(opts, overrides, pull_request, message);
-            if !pull_request_updates.is_empty() {
-                if opts.dry_run {
-                    output(
-                        "  ",
-                        &format!("Would update PR #{} title/body", pull_request.number),
-                    )?;
-                } else {
-                    gh.update_pull_request(pull_request.number, pull_request_updates)
-                        .await?;
-                    output("✍", "Updated commit message on GitHub")?;
-                }
+        let pull_request_updates = title_and_body_updates(opts, overrides, pull_request, message);
+        let updated = match (
+            pull_request_updates.title.is_some(),
+            pull_request_updates.body.is_some(),
+        ) {
+            (true, true) => Some("title and body"),
+            (true, false) => Some("title"),
+            (false, true) => Some("body"),
+            (false, false) => None,
+        };
+        if let Some(updated) = updated {
+            let number = pull_request.number;
+            if opts.dry_run {
+                output(
+                    "  ",
+                    &format!("Would update the {updated} of #{number} on GitHub"),
+                )?;
+            } else {
+                gh.update_pull_request(number, pull_request_updates).await?;
+                output(
+                    "✍",
+                    &format!("Updated the {updated} of #{number} on GitHub"),
+                )?;
             }
-
-            return Ok(Published {
-                number: Some(pull_request.number),
-                head: pull_request.head.clone(),
-                head_oid: pull_request.head_oid,
-                base: Some(pull_request.base.branch_name().to_string()),
-            });
         }
+
+        return Ok(Published {
+            number: Some(pull_request.number),
+            head: pull_request.head.clone(),
+            head_oid: pull_request.head_oid,
+            base: Some(pull_request.base.branch_name().to_string()),
+        });
     }
 
     // The commit to merge into the new Pull Request commit, if any, to bring
@@ -1536,7 +1539,10 @@ async fn diff_impl(
         }
     }
 
-    let mut github_commit_message = opts.message.clone();
+    let mut github_commit_message = opts
+        .message
+        .clone()
+        .filter(|_| pull_request.is_some() || !opts.message_only_for_updates);
     if pull_request.is_some()
         && github_commit_message.is_none()
         && steps.is_empty()
@@ -1681,7 +1687,6 @@ async fn diff_impl(
 
             // Push the Pull Request branch. Its base, the parent's Pull
             // Request branch or master, is on GitHub already.
-            pushing_new(pull_request_branch.branch_name())?;
             run_command(&mut cmd)
                 .await
                 .reword("git push failed".to_string())?;

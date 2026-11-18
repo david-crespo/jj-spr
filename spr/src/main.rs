@@ -89,6 +89,10 @@ enum Commands {
     /// changes and rebase the rest onto the main branch
     Sync(commands::sync::SyncOptions),
 
+    /// Submit a stack file's Pull Requests: open new ones, update existing
+    /// ones, and update the GitHub stack
+    Submit(commands::submit::SubmitOptions),
+
     /// Write a new stack file, or check one. A stack file lists a stack's
     /// Pull Requests for `jj spr submit`.
     #[clap(subcommand)]
@@ -228,6 +232,7 @@ pub async fn spr() -> Result<()> {
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,
         Commands::Sync(opts) => commands::sync::sync(opts, &jj, &mut gh, &config).await?,
         Commands::Stack(opts) => commands::stack::stack(opts, &jj, &gh, &config).await?,
+        Commands::Submit(opts) => commands::submit::submit(opts, &jj, &mut gh, &config).await?,
         Commands::StackFile(commands::stack_file::StackFileCommand::Status(opts)) => {
             commands::stack_file::status(opts, &jj, &gh, &config).await?
         }

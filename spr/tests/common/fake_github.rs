@@ -130,6 +130,8 @@ pub struct State {
     /// How many more mergeability queries answer `UNKNOWN`, as GitHub does
     /// while it is still computing mergeability.
     pub unknown_mergeability_polls: u32,
+    /// Head branches whose next Pull Request GitHub refuses to create, once.
+    pub failing_creations: Vec<String>,
     pub requests: Vec<Recorded>,
     /// Pull requests and stacks share one sequence of numbers, as on GitHub.
     next_number: u64,
@@ -912,12 +914,30 @@ impl State {
 
         match (method, segments.as_slice()) {
             ("POST", ["pulls"]) => {
+                let head = body["head"].as_str().unwrap_or_default();
+                if let Some(i) = self.failing_creations.iter().position(|b| b == head) {
+                    self.failing_creations.remove(i);
+                    return api_error(500, "fake github: creating this pull request failed");
+                }
                 let heads = self.branches();
                 for key in ["head", "base"] {
                     let branch = body[key].as_str().unwrap_or_default();
                     if !heads.contains_key(branch) {
                         return api_error(422, format!("Branch {branch:?} does not exist."));
                     }
+                }
+                // Live GitHub refused this for the same head and base; other
+                // bases were not tried.
+                let base = body["base"].as_str().unwrap_or_default();
+                if self
+                    .prs
+                    .values()
+                    .any(|pr| pr.is_open() && pr.head_ref == head && pr.base_ref == base)
+                {
+                    return api_error(
+                        422,
+                        format!("A pull request already exists for {}:{head}.", self.owner),
+                    );
                 }
                 let number = self.next_number;
                 self.next_number += 1;
@@ -1239,6 +1259,27 @@ fn parse_query(query: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Make pushes to the repository at `git_dir` refuse a ref name longer than
+/// 255 bytes, as GitHub's pre-receive hook does (error GH005).
+fn refuse_long_refs(git_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = git_dir.join("hooks").join("pre-receive");
+    std::fs::create_dir_all(hook.parent().unwrap()).expect("hooks directory");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\n\
+         while read old new ref; do\n\
+         \x20 bytes=$(printf %s \"$ref\" | wc -c)\n\
+         \x20 if [ $bytes -gt 255 ]; then\n\
+         \x20   echo \"error: GH005: Sorry, refs longer than 255 bytes are not allowed.\" >&2\n\
+         \x20   exit 1\n\
+         \x20 fi\n\
+         done\n",
+    )
+    .expect("pre-receive hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("hook mode");
+}
+
 /// A running fake GitHub. The server stops when this is dropped.
 pub struct FakeGitHub {
     state: Arc<Mutex<State>>,
@@ -1249,6 +1290,7 @@ pub struct FakeGitHub {
 
 impl FakeGitHub {
     pub fn start(owner: &str, name: &str, git_dir: &Path, stacks_enabled: bool) -> Self {
+        refuse_long_refs(git_dir);
         let state = Arc::new(Mutex::new(State {
             owner: owner.into(),
             name: name.into(),
@@ -1260,6 +1302,7 @@ impl FakeGitHub {
             merge_ops: HashMap::new(),
             failing_queries: Vec::new(),
             unknown_mergeability_polls: 0,
+            failing_creations: Vec::new(),
             requests: Vec::new(),
             next_number: 1,
         }));

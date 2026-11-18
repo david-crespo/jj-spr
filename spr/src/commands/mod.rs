@@ -16,4 +16,5 @@ pub mod list;
 pub mod patch;
 pub mod stack;
 pub mod stack_file;
+pub mod submit;
 pub mod sync;

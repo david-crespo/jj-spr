@@ -54,7 +54,7 @@ pub struct StackFile {
 /// One Pull Request of a stack file. People and agents write `tip`,
 /// `title`, and `body`; jj-spr writes the rest. The fields are in the order
 /// they are written.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     /// A bookmark or a change ID: the Pull Request's top change.
     pub tip: String,
@@ -288,6 +288,21 @@ impl Problem {
             message: message.into(),
         }
     }
+}
+
+/// A list of problems for an error message: "<name> has N problems:" and
+/// one line for each.
+pub fn describe_problems(name: &str, problems: &[Problem]) -> String {
+    let mut text = format!(
+        "{name} has {} problem{}:",
+        problems.len(),
+        if problems.len() == 1 { "" } else { "s" }
+    );
+    for problem in problems {
+        text.push_str("\n- ");
+        text.push_str(&problem.message.replace('\n', "\n  "));
+    }
+    text
 }
 
 /// Resolve a tip to the one visible change it names: a local bookmark, or a
@@ -626,9 +641,9 @@ pub struct Check {
 /// Check the entries at `indices` (bottom first) for everything `submit`
 /// refuses on: the problems `resolve` finds, entries without a title,
 /// Pull Requests that merged or were closed, open Pull Requests in their
-/// GitHub stack that the file doesn't list, entries whose Pull Requests
-/// are in another order on GitHub, and titles and bodies that changed both in
-/// the file and on GitHub since the last push (unless `overwrite_github`).
+/// GitHub stack that the file doesn't list, and titles and bodies that
+/// changed both in the file and on GitHub since the last push (unless
+/// `overwrite_github`).
 /// `dir` is the stack file's directory, and `name` its path, for messages.
 #[allow(clippy::too_many_arguments)]
 pub async fn check(
