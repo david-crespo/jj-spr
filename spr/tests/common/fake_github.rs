@@ -89,6 +89,9 @@ struct MergeOperation {
     pr_number: u64,
     method: String,
     expected_head: String,
+    /// `commit_title` and `commit_message`, which GitHub applies only to
+    /// this Pull Request's commit, not to the ones merged below it.
+    commit: Option<(String, String)>,
     status: String,
     message: String,
     sha: Option<String>,
@@ -117,6 +120,11 @@ pub struct State {
     merge_ops: HashMap<u64, MergeOperation>,
     /// GraphQL operations (by name) that answer with an error.
     pub failing_queries: Vec<String>,
+    /// How many more mergeability queries answer `UNKNOWN`, as GitHub does
+    /// while it is still computing mergeability.
+    pub unknown_mergeability_polls: u32,
+    /// Pull Requests that GitHub reports as `CONFLICTING`.
+    pub conflicting: Vec<u64>,
     pub requests: Vec<Recorded>,
     /// Pull requests and stacks share one sequence of numbers, as on GitHub.
     next_number: u64,
@@ -428,7 +436,7 @@ impl State {
             "baseRefName": pr.base_ref,
             "headRefName": pr.head_ref,
             "headRefOid": self.branches().get(&pr.head_ref).unwrap_or(&pr.last_head_sha),
-            "mergeable": "MERGEABLE",
+            "mergeable": if self.conflicting.contains(&number) { "CONFLICTING" } else { "MERGEABLE" },
             "mergeCommit": pr.merge_commit_sha.as_ref().map(|oid| json!({"oid": oid})),
             "latestOpinionatedReviews": {"nodes": reviews},
             "reviewRequests": {"nodes": []},
@@ -584,21 +592,32 @@ impl State {
 
     // -- merging -----------------------------------------------------------
 
-    fn squash_merge(&mut self, number: u64) -> String {
-        self.squash_merge_from(number, None)
+    fn squash_merge(&mut self, number: u64, commit: Option<(String, String)>) -> String {
+        self.squash_merge_from(number, None, commit)
     }
 
     /// Squash-merge `number` into its base. `merge_base` is where its own
     /// changes start, when that is not the merge base with the base branch
-    /// (a stacked PR whose parent was just squash-merged below it).
-    fn squash_merge_from(&mut self, number: u64, merge_base: Option<&str>) -> String {
+    /// (a stacked PR whose parent was just squash-merged below it). `commit`
+    /// is the requested title and message; without it the message is the
+    /// fake's own default.
+    fn squash_merge_from(
+        &mut self,
+        number: u64,
+        merge_base: Option<&str>,
+        commit: Option<(String, String)>,
+    ) -> String {
         let heads = self.branches();
         let (base_ref, head_ref, title) = {
             let pr = &self.prs[&number];
             (pr.base_ref.clone(), pr.head_ref.clone(), pr.title.clone())
         };
         let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
-        let message = format!("{title} (#{number})");
+        let message = match commit {
+            Some((title, body)) if body.is_empty() => title,
+            Some((title, body)) => format!("{title}\n\n{body}"),
+            None => format!("{title} (#{number})"),
+        };
         let commit = self.merge_tree_commit(merge_base, &base, &head, &[&base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{base_ref}"), &commit]);
         let pr = self.prs.get_mut(&number).unwrap();
@@ -647,10 +666,12 @@ impl State {
         let base_ref = self.prs[&prefix[0]].base_ref.clone();
         let old_top = self.branches()[&self.prs[&prefix[cut - 1]].head_ref].clone();
         let mut below: Option<String> = None;
+        let commit = self.merge_ops[&pr_number].commit.clone();
         for number in &prefix {
             let head = self.branches()[&self.prs[number].head_ref].clone();
             self.prs.get_mut(number).unwrap().base_ref = base_ref.clone();
-            self.squash_merge_from(*number, below.as_deref());
+            let commit = commit.clone().filter(|_| *number == pr_number);
+            self.squash_merge_from(*number, below.as_deref(), commit);
             below = Some(head);
         }
         let (mut previous_base, mut previous_old) = (base_ref.clone(), old_top);
@@ -682,6 +703,7 @@ impl State {
                     pr_number: number,
                     method: "squash".into(),
                     expected_head: head,
+                    commit: None,
                     status: "pending".into(),
                     message: "Merge request enqueued.".into(),
                     sha: None,
@@ -689,7 +711,7 @@ impl State {
             );
             self.complete_stack_merge(number);
         } else {
-            self.squash_merge(number);
+            self.squash_merge(number, None);
         }
     }
 
@@ -835,7 +857,7 @@ impl State {
                 {
                     return api_error(409, "Head branch was modified.");
                 }
-                let sha = self.squash_merge(n);
+                let sha = self.squash_merge(n, requested_commit(body));
                 Ok((
                     200,
                     Some(json!({"sha": sha, "merged": true,
@@ -874,6 +896,7 @@ impl State {
                     pr_number: n,
                     method: body["merge_method"].as_str().unwrap_or("merge").to_string(),
                     expected_head: expected,
+                    commit: requested_commit(body),
                     status: "pending".into(),
                     message: "Merge request enqueued.".into(),
                     sha: None,
@@ -1006,7 +1029,7 @@ impl State {
         }
     }
 
-    fn graphql(&self, body: &Value) -> Value {
+    fn graphql(&mut self, body: &Value) -> Value {
         let name = body["operationName"].as_str().unwrap_or_default();
         let variables = &body["variables"];
         if self.failing_queries.iter().any(|q| q == name) {
@@ -1014,10 +1037,17 @@ impl State {
         }
         match name {
             "PullRequestQuery" | "PullRequestMergeabilityQuery" => {
-                let data = variables["number"]
+                let mut data = variables["number"]
                     .as_u64()
                     .filter(|n| self.prs.contains_key(n))
                     .map(|n| self.graphql_pr(n));
+                if name == "PullRequestMergeabilityQuery"
+                    && self.unknown_mergeability_polls > 0
+                    && let Some(pr) = &mut data
+                {
+                    self.unknown_mergeability_polls -= 1;
+                    pr["mergeable"] = json!("UNKNOWN");
+                }
                 json!({"data": {"repository": {"pullRequest": data}}})
             }
             "PullRequestStatusQuery" => {
@@ -1060,6 +1090,15 @@ impl State {
     }
 }
 
+/// The `commit_title` and `commit_message` of a merge request. GitHub
+/// uses its default for whichever is missing; the fake uses its own default
+/// unless a title is given.
+fn requested_commit(body: &Value) -> Option<(String, String)> {
+    let title = body["commit_title"].as_str()?;
+    let message = body["commit_message"].as_str().unwrap_or_default();
+    Some((title.to_string(), message.to_string()))
+}
+
 fn parse_number(text: &str) -> Result<u64, ApiError> {
     text.parse().or_else(|_| api_error(404, "Not Found"))
 }
@@ -1092,6 +1131,8 @@ impl FakeGitHub {
             checks: HashMap::new(),
             merge_ops: HashMap::new(),
             failing_queries: Vec::new(),
+            unknown_mergeability_polls: 0,
+            conflicting: Vec::new(),
             requests: Vec::new(),
             next_number: 1,
         }));

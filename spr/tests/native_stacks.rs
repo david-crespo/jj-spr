@@ -324,6 +324,75 @@ fn land_bottom() {
     assert_eq!(env.pr_files(prs[1]), vec!["b.txt"]);
 }
 
+/// The messages of the commits on main after `since`, oldest first.
+fn messages_on_main_since(env: &TestEnv, since: &str) -> Vec<String> {
+    env.remote_git(&[
+        "log",
+        "--reverse",
+        "--format=%B%x00",
+        &format!("{since}..main"),
+    ])
+    .split('\0')
+    .map(str::trim)
+    .filter(|m| !m.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+/// The squash message jj-spr gives Pull Request `number` titled `title`.
+fn landed_message(number: u64, title: &str) -> String {
+    let url = format!("https://github.com/fake/repo/pull/{number}");
+    format!("{title}\n\nReviewers: \n\nPull Request: {url}")
+}
+
+#[test]
+fn land_top_gives_every_pull_request_its_message() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    assert_eq!(
+        messages_on_main_since(&env, &main),
+        vec![
+            landed_message(prs[0], "Change A"),
+            landed_message(prs[1], "Change B"),
+            landed_message(prs[2], "Change C"),
+        ]
+    );
+}
+
+#[test]
+fn land_reports_which_pull_requests_landed_when_one_fails() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let merged_branch = env.pr(prs[0]).head_ref;
+    env.gh.state().conflicting.push(prs[1]);
+
+    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
+    assert!(!out.success, "land should fail:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!(
+            "Landed #{}, but not #{}, #{}",
+            prs[0], prs[1], prs[2]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(text.contains("not mergeable"), "{}", out.text);
+    assert!(env.pr(prs[0]).merged_at.is_some(), "A should be merged");
+    for &n in &prs[1..] {
+        assert!(env.pr(n).is_open(), "PR #{n} should still be open");
+    }
+    assert!(
+        env.branch(&merged_branch).is_none(),
+        "the landed branch should be deleted"
+    );
+}
+
 #[test]
 fn land_middle_needs_confirmation() {
     let env = TestEnv::new();
@@ -357,8 +426,8 @@ fn land_middle_merges_stack_below() {
     }
     assert_eq!(
         env.requests_since(0, "PUT", "merge-async").len(),
-        1,
-        "one stack merge"
+        3,
+        "one stack merge per Pull Request"
     );
     let top = env.pr(prs[3]);
     assert!(
@@ -602,6 +671,36 @@ fn land_keeps_branches_when_open_pull_requests_cannot_be_listed() {
         "B was closed: {:?}",
         dependent.closed_reason
     );
+}
+
+#[test]
+fn land_waits_for_github_to_compute_mergeability() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().unknown_mergeability_polls = 30;
+
+    let out = env.spr(&["land", "-r", &changes[0]]);
+    assert!(out.flat().contains("Waiting for GitHub"), "{}", out.text);
+    assert!(env.pr(prs[0]).merged_at.is_some(), "A should be merged");
+}
+
+#[test]
+fn land_gives_up_when_github_does_not_compute_mergeability() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().unknown_mergeability_polls = u32::MAX;
+
+    let out = env.try_spr(&["land", "-r", &changes[0]]);
+    assert!(!out.success, "land should give up:\n{}", out.text);
+    assert!(
+        out.flat()
+            .contains("GitHub has not finished computing whether"),
+        "{}",
+        out.text
+    );
+    assert!(env.pr(prs[0]).is_open());
 }
 
 #[test]

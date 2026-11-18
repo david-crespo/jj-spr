@@ -94,13 +94,8 @@ pub async fn land(
         )));
     }
 
-    // Okay, we are confident now that the PR can be merged and the result of
-    // that merge would be a master commit with the same tree as if we
-    // cherry-picked the commit onto master.
-    let pr_head_oid = pull_request.head_oid;
-
-    // A Pull Request in a native GitHub stack is merged through GitHub's
-    // stack-aware merge, which merges every Pull Request below it too.
+    // A Pull Request in a native GitHub stack lands together with every open
+    // Pull Request below it.
     let stack = gh.stack_containing(pull_request_number).await?;
     // Without a stack, a Pull Request based on another open Pull Request's
     // branch would be squash-merged together with everything below it.
@@ -212,100 +207,39 @@ pub async fn land(
         .await?;
     }
 
-    // Check whether GitHub says this PR is mergeable. This happens in a
-    // retry-loop because recent changes to the Pull Request can mean that
-    // GitHub has not finished the mergeability check yet.
-    let mut attempts = 0;
-    let result = loop {
-        attempts += 1;
-
-        let mergeability = gh
-            .get_pull_request_mergeability(pull_request_number)
-            .await?;
-
-        if mergeability.head_oid != pr_head_oid {
-            break Err(Error::new(formatdoc!(
-                "The Pull Request seems to have been updated externally.
-                     Please try again!"
-            )));
-        }
-
-        // A stacked Pull Request keeps its base; the stack merge lands it.
-        if (mergeability.base.is_master_branch() || stack.is_some())
-            && mergeability.mergeable.is_some()
-        {
-            if mergeability.mergeable != Some(true) {
-                break Err(Error::new(formatdoc!(
-                    "GitHub concluded the Pull Request is not mergeable at \
-                    this point. Please rebase your changes and try again!"
-                )));
+    // Merge bottom first, one Pull Request at a time, so each one gets its
+    // own title and message (GitHub applies them only to the Pull Request
+    // named in the merge call). After each merge GitHub rebases the rest of
+    // the stack and retargets the next Pull Request to master, so only the
+    // first one still has the head fetched above.
+    let merging: Vec<&crate::github::PullRequest> =
+        merged_below.iter().chain([&pull_request]).collect();
+    let mut landed: Vec<&crate::github::PullRequest> = Vec::new();
+    let mut merged_sha = None;
+    let mut failure = None;
+    for pr in merging.iter().copied() {
+        let expected_head = landed.is_empty().then_some(pr.head_oid);
+        let merged = match wait_until_mergeable(gh, pr.number, expected_head).await {
+            Ok(head) => squash_merge(gh, config, pr, head, stack.is_some()).await,
+            Err(error) => Err(error),
+        };
+        match merged {
+            Ok(sha) => {
+                if merging.len() > 1 {
+                    output("🛬", &format!("Landed #{}", pr.number))?;
+                }
+                landed.push(pr);
+                merged_sha = sha;
             }
-
-            // TODO: Implement Jujutsu-native commit fetching and tree comparison
-            // For now, skip the merge commit validation
-            // This would need to be rewritten using jj commands
-
-            break Ok(());
-        }
-
-        if attempts >= 10 {
-            // After ten failed attempts we give up.
-            break Err(Error::new(
-                "GitHub Pull Request did not update. Please try again!",
-            ));
-        }
-
-        // Wait one second before retrying
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    };
-
-    let result = match result {
-        Ok(()) => {
-            // We have checked that merging the Pull Request branch into the master
-            // branch produces the intended result, and that's independent of whether we
-            // used a base branch with this Pull Request or not. We have made sure the
-            // target of the Pull Request is set to the master branch. So let GitHub do
-            // the merge now!
-            if stack.is_some() {
-                gh.merge_stacked_pull_request(pull_request_number, pr_head_oid, "squash")
-                    .await
-                    .context(format!(
-                        "squash-merging PR #{} (head {})",
-                        pull_request_number, pr_head_oid
-                    ))
-            } else {
-                octocrab::instance()
-                    .pulls(&config.owner, &config.repo)
-                    .merge(pull_request_number)
-                    .method(octocrab::params::pulls::MergeMethod::Squash)
-                    .title(pull_request.title)
-                    .message(build_github_body_for_merging(&pull_request.sections))
-                    .sha(format!("{}", pr_head_oid))
-                    .send()
-                    .await
-                    .convert()
-                    .context(format!(
-                        "squash-merging PR #{} (head {})",
-                        pull_request_number, pr_head_oid
-                    ))
-                    .and_then(|merge| {
-                        if merge.merged {
-                            Ok(merge.sha)
-                        } else {
-                            Err(Error::new(formatdoc!(
-                                "GitHub Pull Request merge failed: {}",
-                                merge.message.unwrap_or_default()
-                            )))
-                        }
-                    })
+            Err(error) => {
+                failure = Some(error);
+                break;
             }
         }
-        Err(err) => Err(err),
-    };
+    }
 
-    let merged_sha = match result {
-        Ok(sha) => sha,
-        Err(mut error) => {
+    let failure = match failure {
+        Some(mut error) if landed.is_empty() => {
             output("❌", "GitHub Pull Request merge failed")?;
 
             // If we changed the target branch of the Pull Request earlier, then
@@ -327,24 +261,35 @@ pub async fn land(
 
             return Err(error);
         }
+        // Each landed Pull Request is a complete commit on master, so clean
+        // up after those and report the rest.
+        Some(error) => {
+            let numbers = |prs: &[&crate::github::PullRequest]| {
+                crate::stacks::format_pr_list(&prs.iter().map(|pr| pr.number).collect::<Vec<_>>())
+            };
+            output(
+                "❌",
+                &format!(
+                    "Landed {}, but not {}",
+                    numbers(&landed),
+                    numbers(&merging[landed.len()..])
+                ),
+            )?;
+            Some(error)
+        }
+        None => {
+            output("🛬", "Landed!")?;
+            None
+        }
     };
-
-    output("🛬", "Landed!")?;
 
     // Other open Pull Requests may target a merged Pull Request's branch
     // (natively stacked PRs do). GitHub closes a Pull Request whose base
     // branch is deleted, so move them to master first, and keep any branch
     // that another open Pull Request still uses.
-    let merged_heads: Vec<&crate::github::GitHubBranch> = merged_below
-        .iter()
-        .map(|pr| &pr.head)
-        .chain([&pull_request.head])
-        .collect();
-    let merged_numbers: Vec<u64> = merged_below
-        .iter()
-        .map(|pr| pr.number)
-        .chain([pull_request_number])
-        .collect();
+    let merged_heads: Vec<&crate::github::GitHubBranch> =
+        landed.iter().map(|pr| &pr.head).collect();
+    let merged_numbers: Vec<u64> = landed.iter().map(|pr| pr.number).collect();
     // A legacy base branch made by jj-spr for this Pull Request.
     let legacy_base = (!base_is_master && stack.is_none()).then_some(&pull_request.base);
     let branches_to_delete: Vec<&crate::github::GitHubBranch> =
@@ -497,7 +442,100 @@ pub async fn land(
         }
     }
 
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// How many times `land` asks GitHub whether a Pull Request can be merged
+/// before it gives up. One second apart, that is about two minutes: GitHub
+/// has taken over a minute after a stack was rebased.
+const MERGEABILITY_POLLS: u32 = 120;
+
+fn mergeability_poll_interval() -> Duration {
+    // Tests shorten the wait.
+    std::env::var("SPR_MERGEABILITY_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(Duration::from_secs(1), Duration::from_millis)
+}
+
+/// Wait until Pull Request `number` targets master and GitHub has worked out
+/// whether it can be merged, and refuse if it cannot. Returns its head, which
+/// must be `expected_head` when that is given.
+async fn wait_until_mergeable(
+    gh: &crate::github::GitHub,
+    number: u64,
+    expected_head: Option<git2::Oid>,
+) -> Result<git2::Oid> {
+    for poll in 0..MERGEABILITY_POLLS {
+        let mergeability = gh.get_pull_request_mergeability(number).await?;
+        if expected_head.is_some_and(|head| head != mergeability.head_oid) {
+            return Err(Error::new(format!(
+                "Pull Request #{number} seems to have been updated externally. Please \
+                 try again!"
+            )));
+        }
+        if mergeability.base.is_master_branch()
+            && let Some(mergeable) = mergeability.mergeable
+        {
+            if !mergeable {
+                return Err(Error::new(format!(
+                    "GitHub concluded Pull Request #{number} is not mergeable at this \
+                     point. Please rebase your changes and try again!"
+                )));
+            }
+            return Ok(mergeability.head_oid);
+        }
+        if poll == 0 {
+            output(
+                "⏳",
+                &format!("Waiting for GitHub to work out whether #{number} can be merged"),
+            )?;
+        }
+        tokio::time::sleep(mergeability_poll_interval()).await;
+    }
+    Err(Error::new(format!(
+        "GitHub has not finished computing whether Pull Request #{number} can be \
+         merged. Try again in a minute."
+    )))
+}
+
+/// Squash-merge `pull_request` at `head` with jj-spr's title and message.
+/// A Pull Request in a native stack has to go through GitHub's stack merge.
+async fn squash_merge(
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+    pull_request: &crate::github::PullRequest,
+    head: git2::Oid,
+    stacked: bool,
+) -> Result<Option<String>> {
+    let number = pull_request.number;
+    let message = build_github_body_for_merging(&pull_request.sections);
+    let merged = if stacked {
+        gh.merge_stacked_pull_request(number, head, "squash", &pull_request.title, &message)
+            .await
+    } else {
+        octocrab::instance()
+            .pulls(&config.owner, &config.repo)
+            .merge(number)
+            .method(octocrab::params::pulls::MergeMethod::Squash)
+            .title(pull_request.title.clone())
+            .message(message)
+            .sha(head.to_string())
+            .send()
+            .await
+            .convert()
+            .and_then(|merge| {
+                if merge.merged {
+                    Ok(merge.sha)
+                } else {
+                    Err(Error::new(format!(
+                        "GitHub Pull Request merge failed: {}",
+                        merge.message.unwrap_or_default()
+                    )))
+                }
+            })
+    };
+    merged.context(format!("squash-merging PR #{number} (head {head})"))
 }
 
 /// Refuse Pull Requests that GitHub would not merge, or that are not

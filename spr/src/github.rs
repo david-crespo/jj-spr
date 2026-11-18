@@ -821,12 +821,16 @@ impl GitHub {
 
     /// Merge a Pull Request that is part of a native stack. GitHub only
     /// accepts merges of stacked Pull Requests through its asynchronous merge
-    /// endpoint; this submits the merge and waits for it to finish.
+    /// endpoint; this submits the merge and waits for it to finish. GitHub
+    /// also merges the open Pull Requests below this one, and the commit
+    /// title and message apply only to this one's commit.
     pub async fn merge_stacked_pull_request(
         &self,
         number: u64,
         expected_head: git2::Oid,
         merge_method: &str,
+        commit_title: &str,
+        commit_message: &str,
     ) -> Result<Option<String>> {
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge-async",
@@ -840,6 +844,8 @@ impl GitHub {
                     "merge_action": "direct_merge",
                     "merge_method": merge_method,
                     "sha": expected_head.to_string(),
+                    "commit_title": commit_title,
+                    "commit_message": commit_message,
                 })),
             )
             .await?;

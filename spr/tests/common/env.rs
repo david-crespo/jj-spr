@@ -67,6 +67,7 @@ impl TestEnv {
                 root.path().join("gitconfig").display().to_string(),
             ),
             ("NO_COLOR", "1".into()),
+            ("SPR_MERGEABILITY_POLL_INTERVAL_MS", "10".into()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
