@@ -274,15 +274,10 @@ pub async fn diff(
         vec![jj.get_prepared_commit_for_revision(config, &target_rev)?]
     };
 
-    // Determine the master base OID - this is the commit on master that the stack is based on
+    // The commit on master that the changes are based on. The bottom change
+    // is not directly on it when its parent is outside the selection.
     let master_base_oid = if let Some(first_commit) = prepared_commits.first() {
-        if use_range_mode {
-            // For range mode, the parent of the first commit is the master base
-            first_commit.parent_oid
-        } else {
-            // For single commit mode, find the actual merge base with master
-            jj.get_master_base_for_commit(config, first_commit.oid)?
-        }
+        jj.get_master_base_for_commit(config, first_commit.oid)?
     } else {
         output("👋", "No commits found - nothing to do. Good bye!")?;
         return result;
@@ -421,11 +416,9 @@ pub async fn diff(
     // With native stacks, GitHub refuses to change the base of a Pull Request
     // that is part of a stack. Work out up front which stacks this run is
     // about to invalidate, and dissolve them before changing anything; they
-    // are rebuilt once every Pull Request is published.
-    if native
-        && use_range_mode
-        && let Some(stacks) = gh.list_stacks().await?
-    {
+    // are rebuilt once every Pull Request is published. A stack with members
+    // this run does not publish cannot be rebuilt, so that stops the run.
+    if native && let Some(stacks) = gh.list_stacks().await? {
         let planned = plan_native_bases(
             config,
             &prepared_commits,

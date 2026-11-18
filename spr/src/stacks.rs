@@ -72,10 +72,34 @@ pub fn plan_unstacks(
             .filter(|n| !selected.contains(n))
             .collect();
         if !outside.is_empty() {
+            let rebased: Vec<String> = members_in_selection
+                .iter()
+                .filter(|pr| pr.current_base != pr.expected_base)
+                .map(|pr| {
+                    format!(
+                        "#{} from {} to {}",
+                        pr.number.unwrap_or_default(),
+                        pr.current_base.as_deref().unwrap_or_default(),
+                        pr.expected_base
+                            .as_deref()
+                            .unwrap_or("the branch of a new Pull Request"),
+                    )
+                })
+                .collect();
+            let reason = if rebased.is_empty() {
+                "the order of its Pull Requests changes".to_string()
+            } else {
+                format!(
+                    "GitHub does not allow changing the base of a stacked Pull \
+                     Request, and this run changes the base of {}",
+                    rebased.join(", ")
+                )
+            };
             return Err(format!(
-                "GitHub stack #{} has to be rebuilt, but it also contains {} that \
-                 this run would not update. Run `jj spr diff --all` from the top \
-                 of the stack so every member is republished.",
+                "Not submitting: GitHub stack #{} has to be rebuilt, because \
+                 {reason}. The stack also contains {}, which this run would not \
+                 update. Run `jj spr diff --all` from the top of the stack so \
+                 every member is republished.",
                 stack.number,
                 format_pr_list(&outside),
             ));
@@ -735,7 +759,8 @@ mod tests {
             planned(Some(2), Some("spr/a"), Some("main")),
         ];
         let error = plan_unstacks(&stacks, &selection).unwrap_err();
-        assert!(error.contains("#3"), "{error}");
+        assert!(error.contains("#3,"), "{error}");
+        assert!(error.contains("#2 from spr/a to main"), "{error}");
     }
 
     #[test]
