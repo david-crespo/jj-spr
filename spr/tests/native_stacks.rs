@@ -574,7 +574,13 @@ fn close_keeps_dependents() {
     // GitHub's rules for closing stacked PRs are not modelled.
     env.gh.state().stacks.clear();
 
-    env.spr(&["close", "-r", &changes[1]]);
+    let out = env.spr(&["close", "-r", &changes[1]]);
+    assert!(
+        out.flat()
+            .contains(&format!("because #{} still targets it", prs[2])),
+        "{}",
+        out.text
+    );
     assert!(!env.pr(prs[1]).is_open(), "middle PR should be closed");
     assert!(
         env.branch(&middle_branch).is_some(),
@@ -769,6 +775,52 @@ fn land_gives_up_when_github_does_not_compute_mergeability() {
         out.text
     );
     assert!(env.pr(prs[0]).is_open());
+}
+
+#[test]
+fn land_stops_at_a_pull_request_github_closed() {
+    // B's commit moves into A's branch, and B's branch gets a merge on top,
+    // the shape older versions of jj-spr pushed after a reorder. After A
+    // merges, GitHub's rebase finds no commits of B's own and closes B.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let (a_head, b_head) = (env.head_of(prs[0]), env.head_of(prs[1]));
+    let b_tree = format!("{b_head}^{{tree}}");
+    let merge = env.remote_git(&[
+        "commit-tree",
+        &b_tree,
+        "-p",
+        &b_head,
+        "-p",
+        &a_head,
+        "-m",
+        "merge",
+    ]);
+    let branch = |n: u64| format!("refs/heads/{}", env.pr(n).head_ref);
+    env.remote_git(&["update-ref", &branch(prs[1]), &merge]);
+    env.remote_git(&["update-ref", &branch(prs[0]), &b_head]);
+
+    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
+    assert!(!out.success, "land should stop:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!(
+            "Landed #{}, but not #{}, #{}",
+            prs[0], prs[1], prs[2]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!(
+            "Pull Request #{} was closed without being merged",
+            prs[1]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(!text.contains("has not finished computing"), "{}", out.text);
 }
 
 #[test]

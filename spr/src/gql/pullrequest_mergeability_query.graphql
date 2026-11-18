@@ -5,6 +5,7 @@ query PullRequestMergeabilityQuery(
 ) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      state
       baseRefName
       headRefOid
       mergeable

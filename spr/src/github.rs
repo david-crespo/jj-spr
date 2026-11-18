@@ -162,6 +162,7 @@ pub struct ReviewThread {
 
 #[derive(Debug, Clone)]
 pub struct PullRequestMergeability {
+    pub state: PullRequestState,
     pub base: GitHubBranch,
     pub head_oid: git2::Oid,
     pub mergeable: Option<bool>,
@@ -522,6 +523,13 @@ impl GitHub {
             .ok_or_else(|| Error::new("failed to find PR"))?;
 
         Ok::<_, Error>(PullRequestMergeability {
+            state: match pr.state {
+                pull_request_mergeability_query::PullRequestState::OPEN => PullRequestState::Open,
+                pull_request_mergeability_query::PullRequestState::MERGED => {
+                    PullRequestState::Merged
+                }
+                _ => PullRequestState::Closed,
+            },
             base: self.config.new_github_branch_from_ref(&pr.base_ref_name)?,
             head_oid: git2::Oid::from_str(&pr.head_ref_oid)?,
             mergeable: match pr.mergeable {

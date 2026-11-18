@@ -175,11 +175,16 @@ async fn close_impl(
                 .spawn()?,
         )
     } else {
+        let (targets, changes, them) = if dependents.len() == 1 {
+            ("targets", "its change", "it")
+        } else {
+            ("target", "those changes", "them")
+        };
         output(
             "⚠️",
             &format!(
-                "Keeping branch {} because {} still target it. Rebase those \
-                 changes and run `jj spr diff --all` to restack them.",
+                "Keeping branch {} because {} still {targets} it. Rebase \
+                 {changes} and run `jj spr diff --all` to restack {them}.",
                 pull_request.head.branch_name(),
                 crate::stacks::format_pr_list(&dependents),
             ),

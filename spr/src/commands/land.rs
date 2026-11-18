@@ -468,6 +468,15 @@ async fn wait_until_mergeable(
 ) -> Result<git2::Oid> {
     for poll in 0..MERGEABILITY_POLLS {
         let mergeability = gh.get_pull_request_mergeability(number).await?;
+        // GitHub closes a stacked Pull Request whose rebase after a merge
+        // below it leaves no commits.
+        if mergeability.state == PullRequestState::Closed {
+            return Err(Error::new(format!(
+                "Pull Request #{number} was closed without being merged, so it \
+                 cannot be landed. Abandon its change, or remove the change's \
+                 `Pull Request:` line and run `jj spr diff` to open a new one."
+            )));
+        }
         if expected_head.is_some_and(|head| head != mergeability.head_oid) {
             return Err(Error::new(format!(
                 "Pull Request #{number} seems to have been updated externally. Please \
