@@ -102,13 +102,20 @@ struct Published {
     base: Option<String>,
 }
 
-/// Whether the change will be submitted as a cherry-pick, without changing
-/// its message (see `resolve_cherry_pick`).
-fn wants_cherry_pick(opts: &DiffOptions, message: &crate::message::MessageSectionsMap) -> bool {
-    if opts.no_cherry_pick {
-        return false;
-    }
-    opts.cherry_pick || crate::message::cherry_pick_marked(message)
+/// What `diff_impl` needs for one change that does not depend on what this
+/// run publishes (see `resolve_change`).
+#[derive(Debug)]
+struct Resolved {
+    /// The commit message with the cherry-pick marker and the reviewers as
+    /// they are to be stored locally.
+    message: crate::message::MessageSectionsMap,
+    message_changed: bool,
+    cherry_pick: bool,
+    /// The trees the Pull Request branch and its base should have.
+    head_tree: Oid,
+    base_tree: Oid,
+    /// The reviewers to request for a new Pull Request.
+    reviewers: PullRequestRequestReviewers,
 }
 
 /// `ancestor` is `descendant` or one of its ancestors.
@@ -146,8 +153,104 @@ fn resolve_cherry_pick(
     }
 }
 
+/// Work out what `diff_impl` needs for one change, failing for a missing
+/// title, a cherry-pick that conflicts, or an unknown reviewer. `diff` does
+/// this for every change before it changes anything on GitHub.
+async fn resolve_change(
+    opts: &DiffOptions,
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    commit: &crate::jj::PreparedCommit,
+    master_base_oid: Oid,
+) -> Result<Resolved> {
+    let label = format!(
+        "{} {}",
+        commit.short_id,
+        commit
+            .message
+            .get(&MessageSection::Title)
+            .map(String::as_str)
+            .unwrap_or("(no title)")
+    );
+    let mut message = commit.message.clone();
+    let (cherry_pick, mut message_changed) =
+        resolve_cherry_pick(opts.cherry_pick, opts.no_cherry_pick, &mut message);
+
+    // Without --cherry-pick, these are the trees of the change and its
+    // parent. A change directly on master gets the same trees when it is
+    // cherry-picked onto its parent.
+    let (head_tree, base_tree) = if !cherry_pick || commit.parent_oid == master_base_oid {
+        (
+            jj.get_tree_oid_for_commit(commit.oid)?,
+            jj.get_tree_oid_for_commit(commit.parent_oid)?,
+        )
+    } else {
+        let index = jj.cherrypick(commit.oid, master_base_oid)?;
+        if index.has_conflicts() {
+            return Err(Error::new(format!(
+                "Not submitting: {label} cannot be cherry-picked on {}.",
+                config.master_ref.branch_name(),
+            )));
+        }
+        (
+            jj.write_index(index)?,
+            jj.get_tree_oid_for_commit(master_base_oid)?,
+        )
+    };
+
+    if commit.pull_request_number.is_none() || opts.update_message {
+        validate_commit_message(&message).context(format!("Not submitting {label}"))?;
+    }
+
+    // A new Pull Request requests the reviewers in the message, which is
+    // rewritten to show each user's name.
+    let mut reviewers = PullRequestRequestReviewers::default();
+    if commit.pull_request_number.is_none()
+        && let Some(names) = message.get(&MessageSection::Reviewers)
+    {
+        let unknown = |kind: &str, reviewer: &str| {
+            Error::new(format!(
+                "Not submitting: the Reviewers field of {label} contains unknown \
+                 {kind} '{reviewer}'",
+            ))
+        };
+        let mut checked = Vec::new();
+        for reviewer in parse_name_list(names) {
+            // Teams are indicated with a leading #
+            if let Some(slug) = reviewer.strip_prefix('#') {
+                let Ok(team) = GitHub::get_github_team((&config.owner).into(), slug.into()).await
+                else {
+                    return Err(unknown("team", &reviewer));
+                };
+                reviewers.team_reviewers.push(team.slug.to_string());
+                checked.push(reviewer);
+            } else {
+                let Ok(user) = GitHub::get_github_user(reviewer.clone()).await else {
+                    return Err(unknown("user", &reviewer));
+                };
+                reviewers.reviewers.push(user.login);
+                checked.push(match user.name {
+                    Some(name) => format!("{reviewer} ({})", remove_all_parens(&name)),
+                    None => reviewer,
+                });
+            }
+        }
+        message.insert(MessageSection::Reviewers, checked.join(", "));
+        message_changed = true;
+    }
+
+    Ok(Resolved {
+        message,
+        message_changed,
+        cherry_pick,
+        head_tree,
+        base_tree,
+        reviewers,
+    })
+}
+
 pub async fn diff(
-    opts: DiffOptions,
+    mut opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
@@ -200,7 +303,8 @@ pub async fn diff(
     }
 
     refuse_unreadable_pull_request_lines(jj, config, &prepared_commits)?;
-    refuse_shared_pull_requests(jj, config, &prepared_commits)?;
+    let bottom_parent = jj.prepare_commit(config, prepared_commits[0].parent_oid)?;
+    refuse_shared_pull_requests(jj, &bottom_parent, &prepared_commits)?;
 
     let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
 
@@ -228,6 +332,32 @@ pub async fn diff(
         )));
     }
 
+    let closed: Vec<u64> = pull_requests
+        .iter()
+        .flatten()
+        .filter(|pr| pr.state == PullRequestState::Closed)
+        .map(|pr| pr.number)
+        .collect();
+    if !closed.is_empty() {
+        return Err(Error::new(format!(
+            "Not submitting: {} closed. If you want to open a new one, remove \
+             the 'Pull Request' section from the commit message.",
+            if closed.len() == 1 {
+                format!("Pull Request #{} is", closed[0])
+            } else {
+                format!(
+                    "Pull Requests {} are",
+                    crate::stacks::format_pr_list(&closed)
+                )
+            }
+        )));
+    }
+
+    let mut resolved = Vec::with_capacity(prepared_commits.len());
+    for commit in &prepared_commits {
+        resolved.push(resolve_change(&opts, jj, config, commit, master_base_oid).await?);
+    }
+
     // Everything below compares against the Pull Requests' heads as fetched;
     // stop if one could not be fetched as GitHub reports it.
     for pr in pull_requests.iter().flatten() {
@@ -250,10 +380,12 @@ pub async fn diff(
     // stop before changing anything if that would drop someone else's work.
     if !opts.discard_remote_changes {
         let mut changed_remotely = Vec::new();
-        for (commit, pull_request) in zip(prepared_commits.iter(), pull_requests.iter()) {
+        for ((commit, pull_request), resolved) in
+            zip(zip(&prepared_commits, &pull_requests), &resolved)
+        {
             if let Some(pr) = pull_request
                 && pr.state == PullRequestState::Open
-                && !wants_cherry_pick(&opts, &commit.message)
+                && !resolved.cherry_pick
                 && jj.pr_has_remote_changes(config, commit, pr)?
             {
                 changed_remotely.push(pr.number);
@@ -275,6 +407,17 @@ pub async fn diff(
         }
     }
 
+    // A natively stacked bottom change targets its parent's Pull Request,
+    // which has to exist and be open.
+    let outside_parent = if native
+        && prepared_commits[0].parent_oid != master_base_oid
+        && !resolved[0].cherry_pick
+    {
+        Some(lookup_parent_pull_request(gh, &bottom_parent).await?)
+    } else {
+        None
+    };
+
     // With native stacks, GitHub refuses to change the base of a Pull Request
     // that is part of a stack. Work out up front which stacks this run is
     // about to invalidate, and dissolve them before changing anything; they
@@ -284,13 +427,30 @@ pub async fn diff(
         && let Some(stacks) = gh.list_stacks().await?
     {
         let planned = plan_native_bases(
-            &opts,
             config,
             &prepared_commits,
             &pull_requests,
+            &resolved,
+            outside_parent.as_ref(),
             master_base_oid,
         );
         let to_dissolve = crate::stacks::plan_unstacks(&stacks, &planned).map_err(Error::new)?;
+        // Each updated Pull Request needs a message for its new commit. Ask
+        // now, once for all of them, so that aborting at the prompt leaves
+        // the stacks in place.
+        if !to_dissolve.is_empty() && opts.message.is_none() && !opts.dry_run {
+            let input = tokio::task::spawn_blocking(|| {
+                dialoguer::Input::<String>::new()
+                    .with_prompt("Message for the updated Pull Requests (leave empty to abort)")
+                    .allow_empty(true)
+                    .interact_text()
+            })
+            .await??;
+            if input.is_empty() {
+                return Err(Error::new("Aborted as per user request".to_string()));
+            }
+            opts.message = Some(input);
+        }
         for stack in to_dissolve {
             if opts.dry_run {
                 output(
@@ -308,11 +468,21 @@ pub async fn diff(
     }
 
     let mut message_on_prompt = "".to_string();
-    let mut parent: Option<ParentPullRequest> = None;
     // Published Pull Requests in local parent order, for registering stacks.
-    let mut published_links: Vec<Published> = Vec::new();
+    let mut published_links: Vec<Published> = outside_parent
+        .iter()
+        .map(|parent| Published {
+            number: parent.number,
+            head: parent.branch.clone(),
+            head_oid: parent.head_oid,
+            base: None,
+        })
+        .collect();
+    let mut parent = outside_parent;
 
-    for (prepared_commit, pull_request) in zip(prepared_commits.iter_mut(), pull_requests) {
+    for ((prepared_commit, pull_request), resolved) in
+        zip(zip(prepared_commits.iter_mut(), pull_requests), resolved)
+    {
         if result.is_err() {
             break;
         }
@@ -322,30 +492,10 @@ pub async fn diff(
         }
 
         // A change that is not directly on master is stacked on its parent's
-        // Pull Request. In range mode that is the one we just published;
-        // otherwise look it up.
-        let stacked_on_parent = native
-            && prepared_commit.parent_oid != master_base_oid
-            && !wants_cherry_pick(&opts, &prepared_commit.message);
-        if stacked_on_parent && parent.is_none() {
-            match lookup_parent_pull_request(jj, gh, config, prepared_commit).await {
-                Ok(found) => {
-                    if let Some(number) = found.number {
-                        published_links.push(Published {
-                            number: Some(number),
-                            head: found.branch.clone(),
-                            head_oid: found.head_oid,
-                            base: None,
-                        });
-                    }
-                    parent = Some(found);
-                }
-                Err(error) => {
-                    result = Err(error);
-                    break;
-                }
-            }
-        }
+        // Pull Request: the one published just before it, or for the bottom
+        // change, `outside_parent`.
+        let stacked_on_parent =
+            native && prepared_commit.parent_oid != master_base_oid && !resolved.cherry_pick;
 
         // The further implementation of the diff command is in a separate function.
         // This makes it easier to run the code to update the local commit message
@@ -358,6 +508,7 @@ pub async fn diff(
             gh,
             config,
             prepared_commit,
+            resolved,
             master_base_oid,
             pull_request,
             native,
@@ -470,10 +621,11 @@ pub async fn diff(
 /// Predict each selected Pull Request's base branch after this run, for
 /// deciding which native stacks survive it.
 fn plan_native_bases(
-    opts: &DiffOptions,
     config: &crate::config::Config,
     commits: &[crate::jj::PreparedCommit],
     pull_requests: &[Option<PullRequest>],
+    resolved: &[Resolved],
+    outside_parent: Option<&ParentPullRequest>,
     master_base_oid: Oid,
 ) -> Vec<crate::stacks::PlannedPullRequest> {
     commits
@@ -481,16 +633,14 @@ fn plan_native_bases(
         .enumerate()
         .map(|(i, commit)| {
             let pull_request = pull_requests[i].as_ref();
-            let expected_base = if commit.parent_oid == master_base_oid
-                || wants_cherry_pick(opts, &commit.message)
-            {
+            let expected_base = if commit.parent_oid == master_base_oid || resolved[i].cherry_pick {
                 Some(config.master_ref.branch_name().to_string())
-            } else if i > 0 {
+            } else if i == 0 {
+                outside_parent.map(|parent| parent.branch.branch_name().to_string())
+            } else {
                 pull_requests[i - 1]
                     .as_ref()
                     .map(|parent| parent.head.branch_name().to_string())
-            } else {
-                None
             };
             crate::stacks::PlannedPullRequest {
                 number: pull_request.map(|pr| pr.number),
@@ -565,15 +715,12 @@ fn refuse_unreadable_pull_request_lines(
 /// pushing both copies to one Pull Request would make it its own base.
 fn refuse_shared_pull_requests(
     jj: &crate::jj::Jujutsu,
-    config: &crate::config::Config,
+    bottom_parent: &crate::jj::PreparedCommit,
     commits: &[crate::jj::PreparedCommit],
 ) -> Result<()> {
     let mut linked: Vec<crate::jj::PreparedCommit> = Vec::new();
-    if let Some(bottom) = commits.first() {
-        let parent = jj.prepare_commit(config, bottom.parent_oid)?;
-        if parent.pull_request_number.is_some() {
-            linked.push(parent);
-        }
+    if bottom_parent.pull_request_number.is_some() {
+        linked.push(bottom_parent.clone());
     }
     linked.extend(
         commits
@@ -610,15 +757,12 @@ fn refuse_shared_pull_requests(
     )))
 }
 
-/// Find the Pull Request of a change's parent, which a natively stacked Pull
-/// Request targets when the parent is not part of this run.
+/// Find the Pull Request of the bottom change's parent, which a natively
+/// stacked Pull Request targets when the parent is not part of this run.
 async fn lookup_parent_pull_request(
-    jj: &crate::jj::Jujutsu,
     gh: &crate::github::GitHub,
-    config: &crate::config::Config,
-    commit: &crate::jj::PreparedCommit,
+    parent_commit: &crate::jj::PreparedCommit,
 ) -> Result<ParentPullRequest> {
-    let parent_commit = jj.prepare_commit(config, commit.parent_oid)?;
     let number = parent_commit.pull_request_number.ok_or_else(|| {
         Error::new(formatdoc!(
             "The parent change {} has no Pull Request yet. A natively stacked \
@@ -746,56 +890,26 @@ async fn diff_impl(
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
+    resolved: Resolved,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
     native: bool,
     native_parent: Option<&ParentPullRequest>,
 ) -> Result<Published> {
-    // Parsed commit message of the local commit
+    let Resolved {
+        message: resolved_message,
+        message_changed,
+        cherry_pick: effective_cherry_pick,
+        head_tree: new_head_tree,
+        base_tree: new_base_tree,
+        reviewers: requested_reviewers,
+    } = resolved;
+    local_commit.message = resolved_message;
+    local_commit.message_changed |= message_changed;
     let message = &mut local_commit.message;
-
-    let (effective_cherry_pick, marker_changed) =
-        resolve_cherry_pick(opts.cherry_pick, opts.no_cherry_pick, message);
-    if marker_changed {
-        local_commit.message_changed = true;
-    }
 
     // Check if the local commit is based directly on the master branch.
     let directly_based_on_master = local_commit.parent_oid == master_base_oid;
-
-    // Determine the trees the Pull Request branch and the base branch should
-    // have when we're done here.
-    let (new_head_tree, new_base_tree) = if !effective_cherry_pick || directly_based_on_master {
-        // Unless the user tells us to --cherry-pick, these should be the trees
-        // of the current commit and its parent.
-        // If the current commit is directly based on master (i.e.
-        // directly_based_on_master is true), then we can do this here even when
-        // the user tells us to --cherry-pick, because we would cherry pick the
-        // current commit onto its parent, which gives us the same tree as the
-        // current commit has, and the master base is the same as this commit's
-        // parent.
-        let head_tree = jj.get_tree_oid_for_commit(local_commit.oid)?;
-        let base_tree = jj.get_tree_oid_for_commit(local_commit.parent_oid)?;
-
-        (head_tree, base_tree)
-    } else {
-        // Cherry-pick the current commit onto master
-        let index = jj.cherrypick(local_commit.oid, master_base_oid)?;
-
-        if index.has_conflicts() {
-            return Err(Error::new(formatdoc!(
-                "This commit cannot be cherry-picked on {master}.",
-                master = config.master_ref.branch_name(),
-            )));
-        }
-
-        // This is the tree we are getting from cherrypicking the local commit
-        // on master.
-        let cherry_pick_tree = jj.write_index(index)?;
-        let master_tree = jj.get_tree_oid_for_commit(master_base_oid)?;
-
-        (cherry_pick_tree, master_tree)
-    };
 
     if let Some(number) = local_commit.pull_request_number {
         output(
@@ -808,84 +922,25 @@ async fn diff_impl(
         )?;
     }
 
-    if local_commit.pull_request_number.is_none() || opts.update_message {
-        validate_commit_message(message)?;
-    }
-
-    if let Some(ref pull_request) = pull_request {
-        if pull_request.state == PullRequestState::Closed {
-            return Err(Error::new(formatdoc!(
-                "Pull request is closed. If you want to open a new one, \
-                 remove the 'Pull Request' section from the commit message."
-            )));
-        }
-
-        if !opts.update_message {
-            let mut pull_request_updates: PullRequestUpdate = Default::default();
-            pull_request_updates.update_message(pull_request, message);
-
-            if !pull_request_updates.is_empty() {
-                output(
-                    "⚠️",
-                    indoc!(
-                        "The Pull Request's title/message differ from the \
-                         local commit's message.
-                         Use `spr diff --update-message` to overwrite the \
-                         title and message on GitHub with the local message, \
-                         or `spr amend` to go the other way (rewrite the local \
-                         commit message with what is on GitHub)."
-                    ),
-                )?;
-            }
-        }
-    }
-
-    // Parse "Reviewers" section, if this is a new Pull Request
-    let mut requested_reviewers = PullRequestRequestReviewers::default();
-
-    if local_commit.pull_request_number.is_none()
-        && let Some(reviewers) = message.get(&MessageSection::Reviewers)
+    if let Some(ref pull_request) = pull_request
+        && !opts.update_message
     {
-        let reviewers = parse_name_list(reviewers);
-        let mut checked_reviewers = Vec::new();
+        let mut pull_request_updates: PullRequestUpdate = Default::default();
+        pull_request_updates.update_message(pull_request, message);
 
-        for reviewer in reviewers {
-            // Teams are indicated with a leading #
-            if let Some(slug) = reviewer.strip_prefix('#') {
-                if let Ok(team) = GitHub::get_github_team((&config.owner).into(), slug.into()).await
-                {
-                    requested_reviewers
-                        .team_reviewers
-                        .push(team.slug.to_string());
-
-                    checked_reviewers.push(reviewer);
-                } else {
-                    return Err(Error::new(format!(
-                        "Reviewers field contains unknown team '{}'",
-                        reviewer
-                    )));
-                }
-            } else if let Ok(user) = GitHub::get_github_user(reviewer.clone()).await {
-                requested_reviewers.reviewers.push(user.login);
-                if let Some(name) = user.name {
-                    checked_reviewers.push(format!(
-                        "{} ({})",
-                        reviewer.clone(),
-                        remove_all_parens(&name)
-                    ));
-                } else {
-                    checked_reviewers.push(reviewer);
-                }
-            } else {
-                return Err(Error::new(format!(
-                    "Reviewers field contains unknown user '{}'",
-                    reviewer
-                )));
-            }
+        if !pull_request_updates.is_empty() {
+            output(
+                "⚠️",
+                indoc!(
+                    "The Pull Request's title/message differ from the \
+                     local commit's message.
+                     Use `spr diff --update-message` to overwrite the \
+                     title and message on GitHub with the local message, \
+                     or `spr amend` to go the other way (rewrite the local \
+                     commit message with what is on GitHub)."
+                ),
+            )?;
         }
-
-        message.insert(MessageSection::Reviewers, checked_reviewers.join(", "));
-        local_commit.message_changed = true;
     }
 
     // Get the name of the existing Pull Request branch, or constuct one if
