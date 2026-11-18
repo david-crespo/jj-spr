@@ -456,11 +456,9 @@ impl Finding {
 
 /// Compare a local stack (bottom first) with its Pull Requests and GitHub's
 /// stacks. `stacks` is `None` when stacked pull requests are not enabled.
-/// Base branches and stack membership are only checked for native stacks.
 pub fn review_stack(
     changes: &[ReviewedChange],
     stacks: Option<&[GitHubStack]>,
-    native: bool,
     master: &str,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -504,53 +502,49 @@ pub fn review_stack(
                 count: pr.unresolved_threads,
             });
         }
-        if native {
-            // The first change sits on master, as does a cherry-pick; any other
-            // change targets the Pull Request of the change below it.
-            let expected = if i == 0 || change.cherry_pick {
-                Some((master.to_string(), None))
-            } else {
-                match &changes[i - 1].pr {
-                    Some(below) if below.state == ReviewedState::Open => {
-                        Some((below.head.clone(), Some(below.number)))
-                    }
-                    _ => None, // reported for the change below
+        // The first change sits on master, as does a cherry-pick; any other
+        // change targets the Pull Request of the change below it.
+        let expected = if i == 0 || change.cherry_pick {
+            Some((master.to_string(), None))
+        } else {
+            match &changes[i - 1].pr {
+                Some(below) if below.state == ReviewedState::Open => {
+                    Some((below.head.clone(), Some(below.number)))
                 }
-            };
-            if let Some((expected, below)) = expected
-                && pr.base != expected
-            {
-                findings.push(Finding::WrongBase {
-                    number: pr.number,
-                    actual: pr.base.clone(),
-                    expected,
-                    below,
-                });
+                _ => None, // reported for the change below
             }
+        };
+        if let Some((expected, below)) = expected
+            && pr.base != expected
+        {
+            findings.push(Finding::WrongBase {
+                number: pr.number,
+                actual: pr.base.clone(),
+                expected,
+                below,
+            });
         }
     }
 
-    if native {
-        let links: Vec<PublishedLink> = changes
-            .iter()
-            .filter_map(|c| c.pr.as_ref())
-            .filter(|pr| pr.state == ReviewedState::Open)
-            .map(|pr| PublishedLink {
-                number: Some(pr.number),
-                base: Some(pr.base.clone()),
-                head: pr.head.clone(),
-            })
-            .collect();
-        let segments = segment_numbers(&chain_segments(&links));
-        match stacks {
-            None if !segments.is_empty() => findings.push(Finding::StacksUnavailable),
-            None => {}
-            Some(stacks) => findings.extend(
-                plan_stack_updates(stacks, &segments)
-                    .into_iter()
-                    .map(Finding::Stack),
-            ),
-        }
+    let links: Vec<PublishedLink> = changes
+        .iter()
+        .filter_map(|c| c.pr.as_ref())
+        .filter(|pr| pr.state == ReviewedState::Open)
+        .map(|pr| PublishedLink {
+            number: Some(pr.number),
+            base: Some(pr.base.clone()),
+            head: pr.head.clone(),
+        })
+        .collect();
+    let segments = segment_numbers(&chain_segments(&links));
+    match stacks {
+        None if !segments.is_empty() => findings.push(Finding::StacksUnavailable),
+        None => {}
+        Some(stacks) => findings.extend(
+            plan_stack_updates(stacks, &segments)
+                .into_iter()
+                .map(Finding::Stack),
+        ),
     }
 
     findings
@@ -558,11 +552,9 @@ pub fn review_stack(
 
 /// How many changes, from the bottom of the stack, are ready to land:
 /// submitted and up to date, open, not drafts, with passing (or no) checks,
-/// no unresolved threads, and approved (or not needing approval). Without a
-/// native stack only the bottom change can be landed, so this is at most
-/// one.
-pub fn ready_to_land(changes: &[ReviewedChange], native: bool, require_approval: bool) -> usize {
-    let ready = changes
+/// no unresolved threads, and approved (or not needing approval).
+pub fn ready_to_land(changes: &[ReviewedChange], require_approval: bool) -> usize {
+    changes
         .iter()
         .take_while(|change| {
             let Some(pr) = &change.pr else {
@@ -576,8 +568,7 @@ pub fn ready_to_land(changes: &[ReviewedChange], native: bool, require_approval:
                 && pr.unresolved_threads == 0
                 && pr.review.blocks_landing(require_approval).is_none()
         })
-        .count();
-    if native { ready } else { ready.min(1) }
+        .count()
 }
 
 #[cfg(test)]
@@ -649,13 +640,13 @@ mod tests {
     #[test]
     fn review_clean_stack() {
         let stacks = [stack(1, &[(1, false), (2, false), (3, false)])];
-        assert!(review_stack(&native_stack(), Some(&stacks), true, "main").is_empty());
+        assert!(review_stack(&native_stack(), Some(&stacks), "main").is_empty());
     }
 
     #[test]
     fn review_reports_unregistered_stack() {
         assert_eq!(
-            review_stack(&native_stack(), Some(&[]), true, "main"),
+            review_stack(&native_stack(), Some(&[]), "main"),
             vec![Finding::Stack(StackAction::Create(vec![1, 2, 3]))]
         );
     }
@@ -664,7 +655,7 @@ mod tests {
     fn review_reports_missing_member() {
         let stacks = [stack(1, &[(1, false), (2, false)])];
         assert_eq!(
-            review_stack(&native_stack(), Some(&stacks), true, "main"),
+            review_stack(&native_stack(), Some(&stacks), "main"),
             vec![Finding::Stack(StackAction::Add {
                 stack: 1,
                 pull_requests: vec![3]
@@ -675,7 +666,7 @@ mod tests {
     #[test]
     fn review_reports_stacks_unavailable() {
         assert_eq!(
-            review_stack(&native_stack(), None, true, "main"),
+            review_stack(&native_stack(), None, "main"),
             vec![Finding::StacksUnavailable]
         );
     }
@@ -685,7 +676,7 @@ mod tests {
         let mut changes = native_stack();
         changes[2].pr.as_mut().unwrap().base = "spr/main.c".into();
         let stacks = [stack(1, &[(1, false), (2, false)])];
-        let findings = review_stack(&changes, Some(&stacks), true, "main");
+        let findings = review_stack(&changes, Some(&stacks), "main");
         assert!(findings.contains(&Finding::WrongBase {
             number: 3,
             actual: "spr/main.c".into(),
@@ -698,7 +689,7 @@ mod tests {
     fn review_cherry_pick_targets_master() {
         let mut changes = vec![reviewed(1, "main", "spr/a"), reviewed(2, "main", "spr/b")];
         changes[1].cherry_pick = true;
-        assert!(review_stack(&changes, Some(&[]), true, "main").is_empty());
+        assert!(review_stack(&changes, Some(&[]), "main").is_empty());
     }
 
     #[test]
@@ -714,7 +705,7 @@ mod tests {
             differs_from_pr: false,
         });
         let stacks = [stack(1, &[(1, true), (2, false), (3, false)])];
-        let findings = review_stack(&changes, Some(&stacks), true, "main");
+        let findings = review_stack(&changes, Some(&stacks), "main");
         assert_eq!(
             findings,
             vec![
@@ -726,15 +717,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn review_legacy_stack_skips_base_and_stack_checks() {
-        let changes = vec![
-            reviewed(1, "main", "spr/a"),
-            reviewed(2, "spr/main.b", "spr/b"),
-        ];
-        assert!(review_stack(&changes, Some(&[]), false, "main").is_empty());
     }
 
     #[test]
@@ -772,7 +754,8 @@ mod tests {
 
     #[test]
     fn migration_from_synthetic_base_dissolves_nothing() {
-        // PRs created by legacy jj-spr are not in any stack.
+        // PRs on base branches that older versions of jj-spr made are not
+        // in any stack.
         let selection = [
             planned(Some(1), Some("main"), Some("main")),
             planned(Some(2), Some("spr/main.b"), Some("spr/a")),
@@ -926,7 +909,6 @@ mod tests {
         let findings = review_stack(
             &changes,
             Some(&[stack(1, &[(1, false), (2, false), (3, false)])]),
-            true,
             "main",
         );
         assert_eq!(
@@ -953,39 +935,34 @@ mod tests {
     #[test]
     fn ready_to_land_counts_from_the_bottom() {
         let mut changes = native_stack();
-        assert_eq!(ready_to_land(&changes, true, true), 3);
-        assert_eq!(
-            ready_to_land(&changes, false, true),
-            1,
-            "only the bottom without native stacks"
-        );
+        assert_eq!(ready_to_land(&changes, true), 3);
 
         pr_mut(&mut changes[1]).pending_checks = vec!["build".into()];
-        assert_eq!(ready_to_land(&changes, true, true), 1);
+        assert_eq!(ready_to_land(&changes, true), 1);
         pr_mut(&mut changes[0]).unresolved_threads = 1;
-        assert_eq!(ready_to_land(&changes, true, true), 0);
+        assert_eq!(ready_to_land(&changes, true), 0);
     }
 
     #[test]
     fn ready_to_land_needs_approval_only_when_required() {
         let mut changes = native_stack();
         pr_mut(&mut changes[0]).review = ReviewDecision::None;
-        assert_eq!(ready_to_land(&changes, true, true), 0);
-        assert_eq!(ready_to_land(&changes, true, false), 3);
+        assert_eq!(ready_to_land(&changes, true), 0);
+        assert_eq!(ready_to_land(&changes, false), 3);
         pr_mut(&mut changes[0]).review = ReviewDecision::Required;
-        assert_eq!(ready_to_land(&changes, true, false), 0);
+        assert_eq!(ready_to_land(&changes, false), 0);
     }
 
     #[test]
     fn ready_to_land_skips_stale_drafts_and_unsubmitted() {
         let mut changes = native_stack();
         changes[1].differs_from_pr = true;
-        assert_eq!(ready_to_land(&changes, true, true), 1);
+        assert_eq!(ready_to_land(&changes, true), 1);
         let mut changes = native_stack();
         pr_mut(&mut changes[0]).draft = true;
-        assert_eq!(ready_to_land(&changes, true, true), 0);
+        assert_eq!(ready_to_land(&changes, true), 0);
         let mut changes = native_stack();
         changes[0].pr = None;
-        assert_eq!(ready_to_land(&changes, true, true), 0);
+        assert_eq!(ready_to_land(&changes, true), 0);
     }
 }

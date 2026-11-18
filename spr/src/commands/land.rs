@@ -80,7 +80,6 @@ pub async fn land(
 
     // TODO: Implement Jujutsu-native cherry-pick and merge validation
     // For now, we'll trust GitHub's merge validation and skip local validation
-    let base_is_master = pull_request.base.is_master_branch();
 
     // Skip local cherry-pick validation for Jujutsu workflow
     // GitHub will validate mergeability during the merge process
@@ -95,25 +94,32 @@ pub async fn land(
     }
 
     // A Pull Request in a native GitHub stack lands together with every open
-    // Pull Request below it.
+    // Pull Request below it. Any other Pull Request has to target master:
+    // squash-merging one based on another open Pull Request's branch would
+    // merge both as one commit, and one based on any other branch (such as a
+    // base branch that older versions of jj-spr made) needs `jj spr diff` to
+    // retarget it.
     let stack = gh.stack_containing(pull_request_number).await?;
-    // Without a stack, a Pull Request based on another open Pull Request's
-    // branch would be squash-merged together with everything below it.
-    if !base_is_master && stack.is_none() {
+    if stack.is_none() && !pull_request.base.is_master_branch() {
         let base = pull_request.base.branch_name();
-        if let Some(below) = gh
+        let below = gh
             .get_open_pull_requests()
             .await?
             .into_iter()
-            .find(|pr| pr.head_ref_name == base)
-        {
-            return Err(Error::new(format!(
+            .find(|pr| pr.head_ref_name == base);
+        return Err(Error::new(match below {
+            Some(below) => format!(
                 "Pull Request #{pull_request_number} targets {base}, the branch of \
                  open Pull Request #{below}, and is not in a GitHub stack, so landing \
                  it would merge both as one commit. Land #{below} first.",
                 below = below.number
-            )));
-        }
+            ),
+            None => format!(
+                "Pull Request #{pull_request_number} targets {base}, not {master}. \
+                 Run `jj spr diff` to retarget it before landing it.",
+                master = config.master_ref.branch_name()
+            ),
+        }));
     }
 
     // The Pull Requests below this one that merge with it, bottom first.
@@ -160,53 +166,6 @@ pub async fn land(
         }
     }
 
-    if !base_is_master && stack.is_none() {
-        // The base of the Pull Request on GitHub is not set to master. This
-        // means the Pull Request uses a base branch. We tested above that
-        // merging the Pull Request branch into the master branch produces the
-        // intended result (the same as cherry-picking the local commit onto
-        // master), so what we want to do is actually merge the Pull Request as
-        // it is into master. Hence, we change the base to the master branch.
-        //
-        // Before we do that, there is one more edge case to look out for: if
-        // the base branch contains changes that have since been landed on
-        // master, then Git might be able to figure out that these changes
-        // appear both in the pull request branch (via the merge branch) and in
-        // master, but are identical in those two so it is not a merge conflict
-        // but can go ahead. The result of this in master if we merge now is
-        // correct, but there is one problem: when looking at the Pull Request
-        // in GitHub after merging, it will show these change as part of the
-        // Pull Request. So when you look at the changed files of the Pull
-        // Request, you will see both changes in this commit (great!) and those
-        // in the base branch (a previous commit that has already been landed on
-        // master - not great!). This is because the changes shown are the ones
-        // that happened on this Pull Request branch (now including the base
-        // branch) since it branched off master. This can include changes in the
-        // base branch that are already on master, but were added to master
-        // after the Pull Request branch branched from master.
-        // The solution is to merge current master into the Pull Request branch.
-        // Doing that now means that the final changes done by this Pull Request
-        // are only the changes that are not yet in master. That's what we want.
-        // This final merge never introduces any changes to the Pull Request. In
-        // fact, the tree that we use for the merge commit is the one we got
-        // above from the cherry-picking of this commit on master.
-
-        // TODO: Implement Jujutsu-native merge base and tree comparison
-        // For now, skip the complex merge-in-master logic
-        // This logic would need to be rewritten using jj commands
-
-        // Skip the merge-in-master commit creation for Jujutsu workflow
-
-        gh.update_pull_request(
-            pull_request_number,
-            PullRequestUpdate {
-                base: Some(config.master_ref.branch_name().to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
-    }
-
     // Merge bottom first, one Pull Request at a time, so each one gets its
     // own title and message (GitHub applies them only to the Pull Request
     // named in the merge call). After each merge GitHub rebases the rest of
@@ -239,26 +198,8 @@ pub async fn land(
     }
 
     let failure = match failure {
-        Some(mut error) if landed.is_empty() => {
+        Some(error) if landed.is_empty() => {
             output("❌", "GitHub Pull Request merge failed")?;
-
-            // If we changed the target branch of the Pull Request earlier, then
-            // undo this change now.
-            if !base_is_master && stack.is_none() {
-                let result = gh
-                    .update_pull_request(
-                        pull_request_number,
-                        PullRequestUpdate {
-                            base: Some(pull_request.base.on_github().to_string()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                if let Err(e) = result {
-                    error.push(format!("{}", e));
-                }
-            }
-
             return Err(error);
         }
         // Each landed Pull Request is a complete commit on master, so clean
@@ -290,8 +231,6 @@ pub async fn land(
     let merged_heads: Vec<&crate::github::GitHubBranch> =
         landed.iter().map(|pr| &pr.head).collect();
     let merged_numbers: Vec<u64> = landed.iter().map(|pr| pr.number).collect();
-    // A legacy base branch made by jj-spr for this Pull Request.
-    let legacy_base = (!base_is_master && stack.is_none()).then_some(&pull_request.base);
     let branches_to_delete: Vec<&crate::github::GitHubBranch> =
         match gh.get_open_pull_requests().await {
             Ok(open_pull_requests) => {
@@ -338,16 +277,10 @@ pub async fn land(
                         }
                     }
                 }
-                let used_elsewhere = |branch: &str| {
-                    open_pull_requests
-                        .iter()
-                        .any(|pr| pr.head_ref_name == branch || pr.base_ref_name == branch)
-                };
                 merged_heads
                     .iter()
                     .copied()
                     .filter(|head| !kept_heads.iter().any(|kept| kept == head.branch_name()))
-                    .chain(legacy_base.filter(|base| !used_elsewhere(base.branch_name())))
                     .collect()
             }
             // Without the list, a branch that another Pull Request targets
@@ -356,8 +289,6 @@ pub async fn land(
             Err(error) => {
                 let kept: Vec<&str> = merged_heads
                     .iter()
-                    .copied()
-                    .chain(legacy_base)
                     .map(|branch| branch.branch_name())
                     .collect();
                 output(

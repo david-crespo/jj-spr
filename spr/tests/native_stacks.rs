@@ -24,7 +24,7 @@ fn create_stack() {
             .branches()
             .keys()
             .any(|b| b.starts_with("spr/main.")),
-        "native mode should not create spr/main.* base branches"
+        "diff should not create spr/main.* base branches"
     );
     assert_eq!(
         env.requests_since(0, "POST", "/stacks").len(),
@@ -338,18 +338,15 @@ fn migrate_legacy_stack() {
         env.commit("Change A", "a.txt", "a\n"),
         env.commit("Change B", "b.txt", "b\n"),
     ];
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "legacy"]);
-    let legacy_base = env.pr(env.pr_for(&changes[1])).base_ref;
+    // Opened by an older jj-spr: B targets a base branch of its own.
+    let prs = env.open_legacy_pull_requests(&changes);
+    let legacy_base = env.pr(prs[1]).base_ref;
+    env.spr(&["diff", "--all", "-m", "retarget"]);
+    assert_eq!(env.check_chain(&changes), prs);
     assert!(
-        legacy_base.starts_with("spr/main."),
-        "legacy base was {legacy_base}"
+        env.branch(&legacy_base).is_some(),
+        "the old base branch is left for `jj spr cleanup`"
     );
-    assert!(
-        env.stacks().is_empty(),
-        "legacy mode must not create stacks"
-    );
-    env.spr(&["diff", "--all", "-m", "go native"]);
-    env.check_chain(&changes);
 }
 
 #[test]
@@ -661,24 +658,43 @@ fn land_refuses_a_chained_pull_request_without_a_stack() {
 }
 
 #[test]
-fn land_a_legacy_pull_request_with_a_base_branch() {
+fn land_refuses_a_pull_request_on_a_legacy_base_branch() {
+    // Earlier versions of jj-spr based a Pull Request on a branch of its
+    // own. `jj spr diff` retargets it; `land` does not.
     let env = TestEnv::new();
     let changes = vec![
         env.commit("Change A", "a.txt", "a\n"),
         env.commit("Change B", "b.txt", "b\n"),
     ];
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "legacy"]);
-    let prs = env.prs_for(&changes);
+    let prs = env.open_legacy_pull_requests(&changes);
     let base = env.pr(prs[1]).base_ref;
-    assert!(base.starts_with("spr/main."), "legacy base was {base}");
+    assert_eq!(base, "spr/main.change-b");
 
     env.spr(&["land", "-r", &changes[0]]);
+    let out = env.try_spr(&["land", "-r", &changes[1]]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(
+        out.flat()
+            .contains(&format!("#{} targets {base}, not main", prs[1])),
+        "{}",
+        out.text
+    );
+    assert!(out.flat().contains("Run `jj spr diff`"), "{}", out.text);
+    assert_eq!(env.pr(prs[1]).base_ref, base, "land must not retarget");
+    assert!(env.pr(prs[1]).merged_at.is_none(), "B must not merge");
+
+    env.spr(&["sync"]);
+    env.spr(&["diff", "--all", "-m", "retarget"]);
+    assert_eq!(env.pr(prs[1]).base_ref, "main");
+    assert_eq!(env.pr_files(prs[1]), vec!["b.txt"]);
     env.spr(&["land", "-r", &changes[1]]);
     assert!(env.pr(prs[1]).merged_at.is_some(), "B should be merged");
-    assert!(
-        env.branch(&base).is_none(),
-        "the base branch should be deleted"
-    );
+
+    // The base branch is left over, and `cleanup` removes it.
+    assert!(env.branch(&base).is_some());
+    env.jj(&["git", "fetch"]);
+    env.spr(&["cleanup", "--confirm"]);
+    assert!(env.branch(&base).is_none(), "cleanup should delete {base}");
 }
 
 #[test]

@@ -52,6 +52,11 @@ enum Commands {
 
     /// Create a new or update an existing Pull Request on GitHub from the
     /// current HEAD commit
+    ///
+    /// A change that is not directly on the main branch gets a Pull Request
+    /// that targets its parent change's Pull Request branch. If the
+    /// repository has stacked pull requests enabled, the chain is registered
+    /// as a GitHub stack.
     Diff(commands::diff::DiffOptions),
 
     /// Reformat commit message
@@ -165,8 +170,7 @@ pub async fn spr() -> Result<()> {
     .with_github_api_url(
         get_config_value("spr.githubApiUrl", &git_config)
             .unwrap_or_else(|| jj_spr::config::DEFAULT_GITHUB_API_URL.to_string()),
-    )
-    .with_native_stacks(get_config_bool("spr.nativeStacks", &git_config).unwrap_or(false));
+    );
 
     if let Commands::Format(opts) = cli.command {
         return commands::format::format(opts, &jj, &config).await;

@@ -328,10 +328,49 @@ fn reimport_without_evolog(env: &TestEnv, change: &str) -> String {
     id
 }
 
-/// The start of the propolis #1241-#1245 history: Pull Requests opened
-/// without native stacks, so each one's own change is in a merge commit. B
-/// moves on after C exists, and C removes a line that B adds. Returns the
-/// changes and their Pull Requests.
+/// Push what an older jj-spr pushed for Pull Requests on base branches of
+/// their own after B, the middle of `changes`, was edited: a commit with B's
+/// new tree on B's branch and on C's base branch, and on C's branch a merge
+/// of that base with C's new tree.
+fn push_legacy_update(env: &TestEnv, changes: &[String], prs: &[u64]) {
+    let git = |args: &[&str]| env.git_in(&env.work, args);
+    let b_tree = env.tree_of(&changes[1]);
+    let b_update = git(&[
+        "commit-tree",
+        &b_tree,
+        "-p",
+        &env.head_of(prs[1]),
+        "-m",
+        "edit B",
+    ]);
+    let c_base_branch = env.pr(prs[2]).base_ref;
+    let c_base_update = git(&[
+        "commit-tree",
+        &b_tree,
+        "-p",
+        &env.branch(&c_base_branch).unwrap(),
+        "-m",
+        "[spr] changes introduced through rebase",
+    ]);
+    let c_update = git(&[
+        "commit-tree",
+        &env.tree_of(&changes[2]),
+        "-p",
+        &env.head_of(prs[2]),
+        "-p",
+        &c_base_update,
+        "-m",
+        "edit B",
+    ]);
+    env.push_commit(&b_update, &env.pr(prs[1]).head_ref);
+    env.push_commit(&c_base_update, &c_base_branch);
+    env.push_commit(&c_update, &env.pr(prs[2]).head_ref);
+}
+
+/// The start of the propolis #1241-#1245 history: Pull Requests opened by
+/// an older jj-spr on base branches of their own, so each one's own change
+/// is in a merge commit. B moves on after C exists, and C removes a line
+/// that B adds. Returns the changes and their Pull Requests.
 fn legacy_stack_with_edited_middle(env: &TestEnv, without_evolog: bool) -> (Vec<String>, Vec<u64>) {
     env.push_to_main("shared.txt", "one\ntwo\n");
     env.jj(&["git", "fetch"]);
@@ -344,12 +383,11 @@ fn legacy_stack_with_edited_middle(env: &TestEnv, without_evolog: bool) -> (Vec<
     if without_evolog {
         c = reimport_without_evolog(env, &c);
     }
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "initial"]);
-    std::fs::write(env.work.join("b2.txt"), "b2\n").unwrap();
-    env.jj(&["squash", "--into", &b]);
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "edit B"]);
     let changes = vec![a, b, c];
-    let prs = env.prs_for(&changes);
+    let prs = env.open_legacy_pull_requests(&changes);
+    std::fs::write(env.work.join("b2.txt"), "b2\n").unwrap();
+    env.jj(&["squash", "--into", &changes[1]]);
+    push_legacy_update(env, &changes, &prs);
     (changes, prs)
 }
 
@@ -361,19 +399,21 @@ fn legacy_stack_with_edited_middle(env: &TestEnv, without_evolog: bool) -> (Vec<
 fn converted_stack_after_github_restack(env: &TestEnv, without_evolog: bool) -> Vec<String> {
     let (changes, prs) = legacy_stack_with_edited_middle(env, without_evolog);
     for i in 1..prs.len() {
-        let head = env.head_of(prs[i]);
-        let update = env.remote_git(&[
-            "commit-tree",
-            &format!("{head}^{{tree}}"),
-            "-p",
-            &head,
-            "-p",
-            &env.head_of(prs[i - 1]),
-            "-m",
-            "make them a stack",
-        ]);
-        let branch = env.pr(prs[i]).head_ref;
-        env.remote_git(&["update-ref", &format!("refs/heads/{branch}"), &update]);
+        let parent_head = env.head_of(prs[i - 1]);
+        let update = env.git_in(
+            &env.work,
+            &[
+                "commit-tree",
+                &env.tree_of(&changes[i]),
+                "-p",
+                &env.head_of(prs[i]),
+                "-p",
+                &parent_head,
+                "-m",
+                "make them a stack",
+            ],
+        );
+        env.push_commit(&update, &env.pr(prs[i]).head_ref);
         let parent_branch = env.pr(prs[i - 1]).head_ref;
         let mut state = env.gh.state();
         state.prs.get_mut(&prs[i]).unwrap().base_ref = parent_branch;
@@ -400,7 +440,7 @@ fn converting_a_legacy_stack_survives_github_restack() {
     // commits, so GitHub's stack rebase keeps C's content.
     let env = TestEnv::new();
     let (changes, prs) = legacy_stack_with_edited_middle(&env, false);
-    env.spr(&["diff", "--all", "--native-stack", "-m", "make them a stack"]);
+    env.spr(&["diff", "--all", "-m", "make them a stack"]);
     env.push_to_main("other.txt", "other\n");
     env.gh.state().rebase_stack_on_github(prs[0]);
     assert_eq!(env.pr_files(prs[2]), vec!["c.txt", "shared.txt"]);

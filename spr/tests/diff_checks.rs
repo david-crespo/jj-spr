@@ -178,27 +178,6 @@ fn diff_range_not_starting_on_main_stacks_on_the_parents_pr() {
 }
 
 #[test]
-fn diff_range_not_starting_on_main_without_native_stacks() {
-    // Without native stacks, B's PR gets a base branch with A's changes,
-    // as it does when B is submitted on its own.
-    let env = TestEnv::new();
-    let a = env.commit("Change A", "a.txt", "a\n");
-    let b = env.commit("Change B", "b.txt", "b\n");
-
-    env.spr(&[
-        "diff",
-        "-r",
-        &format!("{a}..{b}"),
-        "--no-native-stack",
-        "-m",
-        "range",
-    ]);
-    let pb = env.pr_for(&b);
-    assert_ne!(env.pr(pb).base_ref, "main");
-    assert_eq!(env.pr_files(pb), vec!["b.txt"]);
-}
-
-#[test]
 fn diff_range_above_a_stacked_pull_request_keeps_the_stack() {
     // `-r B::C` in the stack A, B, C: B's base (A's branch) does not change,
     // so the stack is kept as it is.

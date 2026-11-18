@@ -141,7 +141,7 @@ jj spr land -r @-              # Land the PR
 
 # Stacked PRs (dependent)
 jj spr diff --all              # Create PRs for all changes
-jj spr land -r <change-id>     # Land it (native stacks: and the PRs below it)
+jj spr land -r <change-id>     # Land it, and the PRs below it in its stack
 
 # Independent PRs
 jj spr diff --cherry-pick      # Create independent PR
@@ -164,7 +164,7 @@ Use `--cherry-pick` for changes that don't strictly depend on each other:
 
 ### Dependent Stacks
 For true dependencies where one change requires another:
-- Automatic base branch handling
+- Each PR targets the PR of the change below it, as a GitHub stack
 - Changes must land in order (parent → child)
 - More complex but handles true dependencies
 

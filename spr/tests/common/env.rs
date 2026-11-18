@@ -115,7 +115,6 @@ impl TestEnv {
             ("spr.branchPrefix", "spr/"),
             ("spr.githubAuthToken", "fake-token"),
             ("spr.githubApiUrl", gh.url.as_str()),
-            ("spr.nativeStacks", "true"),
         ] {
             run(&work, "jj", &["config", "set", "--repo", key, value]);
         }
@@ -166,9 +165,24 @@ impl TestEnv {
         run_command(&self.work, &self.env, jj_spr_bin(), args)
     }
 
-    pub fn git_in(&self, cwd: &Path, args: &[&str]) {
+    /// Run git in `cwd`; returns its output, trimmed.
+    pub fn git_in(&self, cwd: &Path, args: &[&str]) -> String {
         let outcome = run_command(cwd, &self.env, "git", args);
         assert!(outcome.success, "git {args:?} failed:\n{}", outcome.text);
+        outcome.text.trim().to_string()
+    }
+
+    /// Push a commit of the working repository to a branch on GitHub.
+    pub fn push_commit(&self, commit: &str, branch: &str) {
+        self.git_in(
+            &self.work,
+            &[
+                "push",
+                "-q",
+                "origin",
+                &format!("{commit}:refs/heads/{branch}"),
+            ],
+        );
     }
 
     /// Create a change on top of `@-`; returns its change ID.
@@ -188,6 +202,69 @@ impl TestEnv {
         self.jj_query(&["log", "--no-graph", "-r", rev, "-T", "commit_id"])
             .trim()
             .to_string()
+    }
+
+    /// Open Pull Requests for a stack of changes on main, bottom first, the
+    /// way earlier versions of jj-spr did for changes not directly on main:
+    /// the bottom one targets main, and each other one targets a base branch
+    /// of its own, `spr/main.<slug>`, which has its parent change's tree. A
+    /// Pull Request branch has one merge commit, of main and its base
+    /// branch, with the change's tree. Each change gets a `Pull Request:`
+    /// line.
+    pub fn open_legacy_pull_requests(&self, changes: &[String]) -> Vec<u64> {
+        let main = self.commit_id("main@origin");
+        let mut prs = Vec::new();
+        for (i, change) in changes.iter().enumerate() {
+            let title = self.jj_query(&[
+                "log",
+                "--no-graph",
+                "-r",
+                change,
+                "-T",
+                "description.first_line()",
+            ]);
+            let slug = title.to_lowercase().replace(' ', "-");
+            let (base, parents) = if i == 0 {
+                ("main".to_string(), vec![main.clone()])
+            } else {
+                let base = format!("spr/main.{slug}");
+                let parent_tree = self.tree_of(&format!("{change}-"));
+                let base_commit = self.git_in(
+                    &self.work,
+                    &[
+                        "commit-tree",
+                        &parent_tree,
+                        "-p",
+                        &main,
+                        "-m",
+                        "[spr] changes to main this commit is based on",
+                    ],
+                );
+                self.push_commit(&base_commit, &base);
+                (base, vec![main.clone(), base_commit])
+            };
+            let mut args = vec!["commit-tree".to_string(), self.tree_of(change)];
+            for parent in parents {
+                args.extend(["-p".to_string(), parent]);
+            }
+            args.extend(["-m".to_string(), title.clone()]);
+            let head = self.git_in(
+                &self.work,
+                &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
+            let branch = format!("spr/{slug}");
+            self.push_commit(&head, &branch);
+            let number = self.gh.state().open_pr_outside_spr(&branch, &base, &title);
+            let description =
+                self.jj_query(&["log", "--no-graph", "-r", change, "-T", "description"]);
+            let description = format!(
+                "{}\n\nPull Request: https://github.com/fake/repo/pull/{number}",
+                description.trim()
+            );
+            self.jj(&["describe", "-r", change, "-m", &description]);
+            prs.push(number);
+        }
+        prs
     }
 
     /// Build a stack of changes `a`, `b`, … and submit it with `diff --all`.

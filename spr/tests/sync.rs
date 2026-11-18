@@ -238,20 +238,20 @@ fn sync_dry_run() {
 
 #[test]
 fn sync_legacy_stack() {
-    // sync works for stacks that use jj-spr's own base branches too.
+    // sync works for stacks on base branches that an older jj-spr made too.
     let env = TestEnv::new();
     let changes = vec![
         env.commit("Change A", "a.txt", "a\n"),
         env.commit("Change B", "b.txt", "b\n"),
     ];
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "legacy"]);
-    let prs = env.prs_for(&changes);
+    let prs = env.open_legacy_pull_requests(&changes);
     env.spr(&["land", "-r", &changes[0]]);
 
     env.spr(&["sync"]);
     assert!(!env.is_visible(&changes[0]));
     assert_rebased_onto_main(&env, &changes[1..]);
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "after sync"]);
+    env.spr(&["diff", "--all", "-m", "after sync"]);
+    assert_eq!(env.pr(prs[1]).base_ref, "main");
     assert_eq!(env.pr_files(prs[1]), vec!["b.txt"]);
 }
 

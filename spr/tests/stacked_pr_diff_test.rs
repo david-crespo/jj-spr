@@ -147,8 +147,8 @@ fn test_stacked_pr_shows_only_child_diff() {
     // For this test, we'll simulate what should happen vs what actually happens
 
     // The correct behavior for stacked PRs:
-    // 1. Child commit should get a PR against a base branch containing the parent
-    // 2. The base branch should be created without affecting the parent's change ID
+    // 1. Child commit should get a PR against the parent's PR branch
+    // 2. The parent's change ID should not change
     // 3. GitHub should show only the child's changes in the PR diff
 
     // Let's check if the parent change ID remains the same after the operations

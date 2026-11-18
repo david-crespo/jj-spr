@@ -157,11 +157,8 @@ fn either_half_alone_is_the_whole_pull_request() {
     assert_eq!(heads(&env, &prs), before, "nothing should be pushed");
 }
 
-fn amend_lower_half(stacks_enabled: bool) {
-    let env = TestEnv::with_stacks(stacks_enabled);
-    if !stacks_enabled {
-        env.jj(&["config", "set", "--repo", "spr.nativeStacks", "false"]);
-    }
+fn amend_lower_half() {
+    let env = TestEnv::new();
     let (changes, prs) = stack_with_split_middle(&env);
     let old = env.head_of(prs[1]);
     env.jj(&["edit", &changes[1]]);
@@ -191,12 +188,7 @@ fn amend_lower_half(stacks_enabled: bool) {
 
 #[test]
 fn amending_the_lower_half_appends_one_commit() {
-    amend_lower_half(true);
-}
-
-#[test]
-fn amending_the_lower_half_appends_one_commit_legacy() {
-    amend_lower_half(false);
+    amend_lower_half();
 }
 
 #[test]
@@ -508,11 +500,8 @@ fn moving_a_pull_request_above_the_one_on_it_appends_its_steps() {
     assert_eq!(pr_commits(&env, p), vec!["Change b1", "Change b2"]);
 }
 
-fn change_added_on_top(stacks_enabled: bool) {
-    let env = TestEnv::with_stacks(stacks_enabled);
-    if !stacks_enabled {
-        env.jj(&["config", "set", "--repo", "spr.nativeStacks", "false"]);
-    }
+fn change_added_on_top() {
+    let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b"]);
     let prs = env.prs_for(&changes);
     let before = pr_commits(&env, prs[1]);
@@ -545,21 +534,13 @@ fn change_added_on_top(stacks_enabled: bool) {
 
 #[test]
 fn a_change_added_on_top_is_appended_as_its_own_commit() {
-    change_added_on_top(true);
-}
-
-#[test]
-fn a_change_added_on_top_is_appended_as_its_own_commit_legacy() {
-    change_added_on_top(false);
+    change_added_on_top();
 }
 
 /// A, submitted alone, then B1, B2 and B3 above it, submitted with
 /// `--one-pr`.
-fn one_pr_above_another(stacks_enabled: bool) {
-    let env = TestEnv::with_stacks(stacks_enabled);
-    if !stacks_enabled {
-        env.jj(&["config", "set", "--repo", "spr.nativeStacks", "false"]);
-    }
+fn one_pr_above_another() {
+    let env = TestEnv::new();
     let a = env.commit("Change A", "a.txt", "a\n");
     env.spr(&["diff", "-r", &a, "-m", "A"]);
     let pa = env.pr_for(&a);
@@ -576,9 +557,7 @@ fn one_pr_above_another(stacks_enabled: bool) {
     }
     let pr = env.pr(pb);
     assert_eq!(pr.title, "Change b3");
-    if stacks_enabled {
-        assert_eq!(pr.base_ref, env.pr(pa).head_ref);
-    }
+    assert_eq!(pr.base_ref, env.pr(pa).head_ref);
     check_pr(
         &env,
         pb,
@@ -603,12 +582,7 @@ fn one_pr_above_another(stacks_enabled: bool) {
 
 #[test]
 fn one_pr_opens_one_pull_request_with_a_commit_per_change() {
-    one_pr_above_another(true);
-}
-
-#[test]
-fn one_pr_opens_one_pull_request_with_a_commit_per_change_legacy() {
-    one_pr_above_another(false);
+    one_pr_above_another();
 }
 
 #[test]
@@ -955,11 +929,8 @@ fn tops_of(groups: &[Vec<String>]) -> String {
     tips(&groups.iter().map(|g| &g[2]).collect::<Vec<_>>())
 }
 
-fn tips_open_a_stack(stacks_enabled: bool) {
-    let env = TestEnv::with_stacks(stacks_enabled);
-    if !stacks_enabled {
-        env.jj(&["config", "set", "--repo", "spr.nativeStacks", "false"]);
-    }
+fn tips_open_a_stack() {
+    let env = TestEnv::new();
     let groups = nine_changes(&env);
     let above = env.commit("Change d1", "d1.txt", "d1\n");
     let before = env.request_count();
@@ -979,9 +950,6 @@ fn tips_open_a_stack(stacks_enabled: bool) {
         assert_eq!(env.pr(pr).title, titles[2]);
         let files: Vec<String> = (1..=3).map(|i| format!("{name}{i}.txt")).collect();
         let files: Vec<&str> = files.iter().map(String::as_str).collect();
-        if !stacks_enabled {
-            base = env.pr(pr).base_ref;
-        }
         check_pr(&env, pr, &base, &files, &group[2]);
         assert_eq!(pr_commits(&env, pr), titles);
         base = env.pr(pr).head_ref;
@@ -990,12 +958,8 @@ fn tips_open_a_stack(stacks_enabled: bool) {
         !description(&env, &above).contains("Pull Request:"),
         "a change above the topmost tip is not submitted"
     );
-    if stacks_enabled {
-        assert_eq!(env.active_stacks(), vec![prs.clone()]);
-        assert_eq!(env.requests_since(before, "POST", "/stacks").len(), 1);
-    } else {
-        assert!(env.stacks().is_empty());
-    }
+    assert_eq!(env.active_stacks(), vec![prs.clone()]);
+    assert_eq!(env.requests_since(before, "POST", "/stacks").len(), 1);
 
     let heads_before = heads(&env, &prs);
     let out = env.spr(&["diff", "--tips", &tops_of(&groups), "-m", "again"]);
@@ -1017,12 +981,7 @@ fn tips_open_a_stack(stacks_enabled: bool) {
 
 #[test]
 fn tips_open_a_stack_of_pull_requests_of_several_changes() {
-    tips_open_a_stack(true);
-}
-
-#[test]
-fn tips_open_a_stack_of_pull_requests_of_several_changes_legacy() {
-    tips_open_a_stack(false);
+    tips_open_a_stack();
 }
 
 #[test]

@@ -163,6 +163,14 @@ Local Jujutsu State:                 GitHub State:
 - Stacked PRs: PR #124 is based on PR #123's branch
 - When PR #123 lands, PR #124 automatically updates to be based on `main`
 
+**Upgrading from an older jj-spr:** Older versions created a base branch of
+its own (`<prefix>main.<title>`) for each dependent PR unless `spr.nativeStacks`
+was set. The `--native-stack` and `--no-native-stack` flags are removed, and
+`spr.nativeStacks` is ignored if still set. The next `jj spr diff` retargets a
+PR on such a base branch to its parent's PR branch or to the main branch.
+Until then, `jj spr land` refuses to land it. Once no open PR uses the old base
+branches, `jj spr cleanup --confirm` deletes them from GitHub.
+
 ## Updating Changes in the Stack
 
 Suppose you need to update the first change (authentication module with ID `rlvkpnrw`) in response to review feedback.

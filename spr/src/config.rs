@@ -44,10 +44,6 @@ pub struct Config {
     /// configured otherwise with `spr.githubApiUrl`). The GraphQL endpoint is
     /// `<github_api_url>/graphql`.
     pub github_api_url: String,
-    /// Whether dependent Pull Requests are published as a native GitHub stack
-    /// (`spr.nativeStacks`): each PR targets the PR branch of its parent
-    /// change, and the chain is registered with GitHub's Stacks API.
-    pub native_stacks: bool,
 }
 
 pub const DEFAULT_GITHUB_API_URL: &str = "https://api.github.com";
@@ -71,7 +67,6 @@ impl Config {
             branch_prefix,
             require_approval,
             github_api_url: DEFAULT_GITHUB_API_URL.to_string(),
-            native_stacks: false,
         }
     }
 
@@ -80,26 +75,9 @@ impl Config {
         self
     }
 
-    pub fn with_native_stacks(mut self, native_stacks: bool) -> Self {
-        self.native_stacks = native_stacks;
-        self
-    }
-
     /// The revset of the main branch as jj sees it, e.g. `main@origin`.
     pub fn trunk_revset(&self) -> String {
         format!("{}@{}", self.master_ref.branch_name(), self.remote_name)
-    }
-
-    /// Resolve the `--native-stack`/`--no-native-stack` flag pair against
-    /// the `spr.nativeStacks` setting.
-    pub fn native_stacks_with(&self, native_stack: bool, no_native_stack: bool) -> bool {
-        if native_stack {
-            true
-        } else if no_native_stack {
-            false
-        } else {
-            self.native_stacks
-        }
     }
 
     pub fn graphql_url(&self) -> String {
@@ -179,35 +157,6 @@ impl Config {
             branch_name = format!("{branch_prefix}{slug}-{suffix}");
         }
         branch_name
-    }
-
-    pub fn get_base_branch_name(
-        &self,
-        existing_ref_names: &HashSet<String>,
-        title: &str,
-    ) -> String {
-        self.find_unused_branch_name(
-            existing_ref_names,
-            &format!("{}.{}", self.master_ref.branch_name(), slugify(title)),
-        )
-    }
-
-    fn find_unused_branch_name(&self, existing_ref_names: &HashSet<String>, slug: &str) -> String {
-        let remote_name = &self.remote_name;
-        let branch_prefix = &self.branch_prefix;
-        let mut branch_name = format!("{branch_prefix}{slug}");
-        let mut suffix = 0;
-
-        loop {
-            let remote_ref = format!("refs/remotes/{remote_name}/{branch_name}");
-
-            if !existing_ref_names.contains(&remote_ref) {
-                return branch_name;
-            }
-
-            suffix += 1;
-            branch_name = format!("{branch_prefix}{slug}-{suffix}");
-        }
     }
 
     pub fn new_github_branch_from_ref(&self, ghref: &str) -> Result<GitHubBranch> {

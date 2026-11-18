@@ -216,28 +216,25 @@ fn stack_stacks_disabled() {
 
 #[test]
 fn stack_legacy_base_branches() {
+    // A Pull Request on a base branch that an older jj-spr made is reported.
     let env = TestEnv::new();
     let changes = [
         env.commit("Change A", "a.txt", "a\n"),
         env.commit("Change B", "b.txt", "b\n"),
     ];
-    env.spr(&["diff", "--all", "--no-native-stack", "-m", "legacy"]);
+    env.open_legacy_pull_requests(&changes);
 
-    let out = env.spr(&["stack", "--no-native-stack"]);
-    assert!(
-        out.text.contains("Everything matches GitHub"),
-        "{}",
-        out.text
-    );
-    assert!(
-        line_for(&out.text, &changes[1]).contains("→ spr/main."),
-        "{}",
-        out.text
-    );
-
-    // With native checks, the base branch is reported.
     let out = env.spr(&["stack"]);
-    assert!(out.flat().contains("#2 targets spr/main."), "{}", out.text);
+    assert!(
+        line_for(&out.text, &changes[1]).contains("→ spr/main.change-b"),
+        "{}",
+        out.text
+    );
+    assert!(
+        out.flat().contains("#2 targets spr/main.change-b"),
+        "{}",
+        out.text
+    );
 }
 
 /// A stack of three with passing, running and failing checks, one approval

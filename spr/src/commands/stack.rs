@@ -30,16 +30,6 @@ pub struct StackOptions {
     #[clap(short = 'r', long)]
     revision: Option<String>,
 
-    /// Check base branches and GitHub stack membership as for native stacks,
-    /// regardless of `spr.nativeStacks`
-    #[clap(long)]
-    native_stack: bool,
-
-    /// Skip the checks that only apply to native stacks, regardless of
-    /// `spr.nativeStacks`
-    #[clap(long, conflicts_with = "native_stack")]
-    no_native_stack: bool,
-
     /// Show each Pull Request's checks, reviewers and unresolved review
     /// threads
     #[clap(short = 'v', long)]
@@ -68,7 +58,6 @@ pub async fn stack(
     gh: &crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
-    let native = config.native_stacks_with(opts.native_stack, opts.no_native_stack);
     let trunk = config.trunk_revset();
     let target = opts.revision.as_deref().unwrap_or("@-");
 
@@ -190,10 +179,9 @@ pub async fn stack(
     let findings = review_stack(
         &reviewed,
         stacks.as_deref(),
-        native,
         config.master_ref.branch_name(),
     );
-    let ready = ready_to_land(&reviewed, native, config.require_approval);
+    let ready = ready_to_land(&reviewed, config.require_approval);
 
     if opts.json {
         print_json(&rows, stacks.as_deref(), &findings, ready, &trunk);

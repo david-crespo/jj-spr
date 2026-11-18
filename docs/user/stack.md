@@ -112,29 +112,22 @@ This is for when the second change literally won't work without the first.
 
    This is equivalent to calling `jj spr diff` on each change in your stack from `@-` back to `main@origin`.
 
-## Native GitHub Stacks
+## GitHub Stacks
 
-By default, a dependent PR targets a base branch that jj-spr creates for it
-(`<prefix>main.<title>`), containing the files of the change below it. GitHub
-can also group dependent PRs into a
+A dependent PR targets the PR branch of the change below it. When the
+repository has stacked pull requests enabled, jj-spr registers the chain as a
+GitHub
 [stack](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests),
-shown as one unit in its UI. That requires each PR to target the PR branch of
-the change below it, which jj-spr does when native stacks are enabled:
+which GitHub shows as one unit in its UI.
 
-```shell
-jj config set --repo spr.nativeStacks true   # or pass --native-stack to jj spr diff
-jj spr diff --all
-```
-
-With native stacks:
-
-- Each PR targets its parent change's PR branch, and jj-spr creates no base
-  branches of its own. Updates still add a commit to the PR branch (with your
-  `-m` message), and each update commit merges in the parent PR's current head,
-  so GitHub keeps showing only the change itself.
+- Updates add commits to the PR branch (with your `-m` message) and never
+  rewrite it. An update merges in the parent PR's current head, so GitHub
+  keeps showing only the change itself, and keeps the change in ordinary
+  commits, which GitHub replays when it rebases the stack after a merge. After
+  a reorder, a PR that moved up gets its whole change in a new commit.
 - After publishing, `jj spr diff` registers the chain as a GitHub stack, or
   appends new PRs to the existing one. GitHub does not allow changing the base
-  of a stacked PR, so when you reorder, insert or remove changes, `jj spr diff
+  of a stacked PR, so when you reorder, insert, or remove changes, `jj spr diff
   --all` dissolves the stack first and rebuilds it. It refuses to do that if
   the stack contains PRs the run would not update; run it from the top of the
   stack instead.
@@ -148,11 +141,16 @@ With native stacks:
   `spr.requireApproval` is set. GitHub then retargets the next PR to the main
   branch and rebases the rest of the stack. Afterwards, run `jj spr sync` and
   then `jj spr diff --all`.
-- Existing PRs that use jj-spr base branches are moved over the next time you
-  run `jj spr diff --all`; the old base branches can be removed with
-  `jj spr cleanup`.
 - If stacked pull requests are not enabled for the repository, the PRs still
   target each other; they just aren't registered as a GitHub stack.
+
+**Upgrading from an older jj-spr:** Older versions created a base branch of
+its own (`<prefix>main.<title>`) for each dependent PR unless `spr.nativeStacks`
+was set. The `--native-stack` and `--no-native-stack` flags are removed, and
+`spr.nativeStacks` is ignored if still set. The next `jj spr diff` retargets a
+PR on such a base branch to its parent's PR branch or to the main branch.
+Until then, `jj spr land` refuses to land it. Once no open PR uses the old base
+branches, `jj spr cleanup --confirm` deletes them from GitHub.
 
 Limitations: repositories that merge through a merge queue are not supported
 yet, and a PR landed from a stack gets GitHub's default squash-commit message
@@ -343,12 +341,12 @@ current head, so they reset when you push.
 It points out anything that does not match, with the command that fixes it:
 changes without a Pull Request, local changes that differ from their Pull
 Request, drafts, failing checks, requested changes, unresolved review threads,
-merged or closed Pull Requests, and, for native stacks, Pull Requests that
-target the wrong branch or are missing from the GitHub stack. The last line
+merged or closed Pull Requests, Pull Requests that target the wrong branch,
+and ones missing from the GitHub stack. The last line
 names the Pull Requests, from the bottom of the stack up, that are ready to
 land: up to date, not drafts, checks passed, no unresolved threads, and
 approved (if `spr.requireApproval` is set, or the repository requires
-reviews). In a native stack, landing the top one of those lands them all.
+reviews). In a GitHub stack, landing the top one of those lands them all.
 
 `-v` replaces the CI and review columns with lines under each Pull Request:
 its checks by name, who approved or requested changes, who has yet to review,
@@ -366,8 +364,7 @@ with their Pull Requests, the GitHub stacks, the findings (each with a stable
 `kind`, such as `failing_checks` or `needs_update`), and `ready_to_land`.
 
 It only reads from GitHub and the repository, and changes nothing. Use `-r` to
-pick another stack, and `--native-stack` or `--no-native-stack` to override
-`spr.nativeStacks` for its checks.
+pick another stack.
 
 ### Syncing after merges
 
