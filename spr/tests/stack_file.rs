@@ -876,3 +876,251 @@ fn submit_adds_an_entry_in_the_middle() {
     );
     assert_eq!(env.active_stacks(), vec![prs]);
 }
+
+// -- land, sync, and close ----------------------------------------------------
+
+/// The subject and body of each commit on main above `from`, oldest first.
+fn main_commits(env: &TestEnv, from: &str) -> Vec<(String, String)> {
+    env.remote_git(&["log", "--reverse", "--format=%H", &format!("{from}..main")])
+        .lines()
+        .map(|commit| {
+            (
+                env.remote_git(&["log", "-1", "--format=%s", commit]),
+                env.remote_git(&["log", "-1", "--format=%b", commit]),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn land_and_sync_a_whole_stack() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+    let main = env.branch("main").unwrap();
+
+    let out = stack.spr("land", &[]);
+    let sync = format!("Run `jj spr sync {}`", stack.path);
+    assert!(out.flat().contains(&sync), "{}", out.text);
+    for &number in &prs {
+        assert!(env.pr(number).merged_at.is_some(), "#{number} merged");
+    }
+    assert!(stack.try_spr("land", &[]).flat().contains(&format!(
+        "#{}, #{}, #{} merged already. Run `jj spr sync",
+        prs[0], prs[1], prs[2]
+    )));
+    let commits = main_commits(&env, &main);
+    let subjects: Vec<&str> = commits.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, vec!["Title of A", "Title of B", "Title of C"]);
+    assert!(
+        commits[1]
+            .1
+            .starts_with("What B does.\n\nIn two paragraphs."),
+        "{commits:?}"
+    );
+    assert!(
+        commits[1].1.contains(&format!("pull/{}", prs[1])),
+        "{commits:?}"
+    );
+
+    let out = stack.spr("sync", &[]);
+    for change in groups.iter().flatten() {
+        assert!(!env.is_visible(change), "{change} should be abandoned");
+    }
+    let b: Vec<&str> = groups[1].iter().map(|c| &c[..8]).collect();
+    assert!(
+        out.flat()
+            .contains(&format!("Abandoned {} (#{})", b.join(", "), prs[1])),
+        "{}",
+        out.text
+    );
+    for i in 0..3 {
+        assert_eq!(stack.entry(i)["merged"], true, "{}", stack.entry(i));
+    }
+    let out = stack.spr("submit", &[]);
+    assert!(out.text.contains("Nothing to submit"), "{}", out.text);
+}
+
+#[test]
+fn land_upto_then_sync_and_submit_the_rest() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+
+    stack.spr("land", &["--upto", "b"]);
+    assert!(env.pr(prs[0]).merged_at.is_some());
+    assert!(env.pr(prs[1]).merged_at.is_some());
+    assert!(env.pr(prs[2]).is_open());
+
+    // Before sync, submit sees the merged Pull Requests.
+    let out = stack.try_spr("submit", &["-m", "unused"]);
+    assert!(!out.success, "submit should refuse:\n{}", out.text);
+    assert!(out.flat().contains("jj spr sync"), "{}", out.text);
+
+    let out = stack.spr("sync", &[]);
+    assert!(out.flat().contains("jj spr submit"), "{}", out.text);
+    assert_eq!(stack.entry(0)["merged"], true);
+    assert_eq!(stack.entry(1)["merged"], true);
+    assert!(stack.entry(2).get("merged").is_none());
+    assert_eq!(env.parent_of(&groups[2][0]), env.commit_id("main@origin"));
+
+    stack.spr("submit", &["-m", "after landing"]);
+    env.check_pr(prs[2], "main", &["c.txt"], &groups[2][0]);
+    stack.spr("land", &[]);
+    assert!(env.pr(prs[2]).merged_at.is_some());
+}
+
+#[test]
+fn land_refuses_a_stack_that_differs_from_the_file() {
+    let env = TestEnv::new();
+    let (stack, _, prs) = submitted(&env);
+    let mut file = stack.read();
+    file["prs"].as_array_mut().unwrap().remove(1);
+    stack.write(file);
+    let out = stack.try_spr("land", &[]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(out.flat().contains("jj spr submit"), "{}", out.text);
+    for &number in &prs {
+        assert!(env.pr(number).is_open(), "#{number} stays open");
+    }
+}
+
+#[test]
+fn land_without_github_stacks_lands_one_at_a_time() {
+    let env = TestEnv::with_stacks(false);
+    let (stack, _, prs) = submitted(&env);
+    let main = env.branch("main").unwrap();
+    stack.spr("land", &[]);
+    for &number in &prs {
+        assert!(env.pr(number).merged_at.is_some(), "#{number} merged");
+    }
+    let subjects: Vec<String> = main_commits(&env, &main)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(subjects, vec!["Title of A", "Title of B", "Title of C"]);
+}
+
+#[test]
+fn close_one_entry_then_drop_it() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+
+    let out = stack.spr("close", &["--pr", "b"]);
+    let resubmit = format!("Run `jj spr submit {}` to restack it", stack.path);
+    assert!(out.flat().contains(&resubmit), "{}", out.text);
+    assert!(!env.pr(prs[1]).is_open());
+    let entry = stack.entry(1);
+    assert_eq!(entry, json!({"tip": "b", "body": "b.md", "x-note": "kept"}));
+    assert!(env.pr(prs[0]).is_open() && env.pr(prs[2]).is_open());
+
+    // Drop B: its entry and its changes.
+    let mut file = stack.read();
+    file["prs"].as_array_mut().unwrap().remove(1);
+    stack.write(file);
+    env.jj(&["abandon", &format!("{}::{}", groups[1][0], groups[1][2])]);
+    stack.spr("submit", &["-m", "drop B"]);
+    assert_eq!(stack.prs(), vec![prs[0], prs[2]]);
+    env.check_pr(prs[2], &env.pr(prs[0]).head_ref, &["c.txt"], &groups[2][0]);
+    assert_eq!(env.active_stacks(), vec![vec![prs[0], prs[2]]]);
+}
+
+#[test]
+fn close_an_entry_and_open_a_new_pull_request() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+    stack.spr("close", &["--pr", "b"]);
+    stack.spr("submit", &["-m", "reopen B"]);
+    let now = stack.prs();
+    assert_eq!((now[0], now[2]), (prs[0], prs[2]));
+    assert!(!prs.contains(&now[1]), "B gets a new Pull Request");
+    env.check_pr(
+        now[1],
+        &env.pr(now[0]).head_ref,
+        &["b1.txt", "b2.txt", "b3.txt"],
+        &groups[1][2],
+    );
+    env.check_pr(now[2], &env.pr(now[1]).head_ref, &["c.txt"], &groups[2][0]);
+    assert_eq!(env.active_stacks(), vec![now]);
+}
+
+#[test]
+fn close_the_top_entry_and_open_a_new_pull_request() {
+    // GitHub keeps the closed Pull Request at the top of the stack, and
+    // chains a Pull Request added to the stack from it.
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+    let c = &groups[2][0];
+    stack.spr("close", &["--pr", c]);
+    let out = stack.spr("submit", &["-m", "reopen C"]);
+    assert!(!out.text.contains("failed"), "{}", out.text);
+    let now = stack.prs();
+    assert_eq!(now[..2], prs[..2]);
+    assert!(!prs.contains(&now[2]), "C gets a new Pull Request");
+    env.check_pr(now[2], &env.pr(now[1]).head_ref, &["c.txt"], c);
+    assert_eq!(env.active_stacks(), vec![now]);
+}
+
+#[test]
+fn close_every_entry() {
+    let env = TestEnv::new();
+    let (stack, _, prs) = submitted(&env);
+    let out = stack.try_spr("close", &[]);
+    assert!(!out.success, "close needs --pr or --all:\n{}", out.text);
+
+    stack.spr("close", &["--all"]);
+    for (i, &number) in prs.iter().enumerate() {
+        assert!(!env.pr(number).is_open(), "#{number} closed");
+        let entry = stack.entry(i);
+        for key in ["pr", "synced", "pushed"] {
+            assert!(entry.get(key).is_none(), "{entry}");
+        }
+    }
+    assert!(
+        !env.gh
+            .state()
+            .branches()
+            .keys()
+            .any(|b| b.starts_with("spr/"))
+    );
+}
+
+#[test]
+fn reorder_entries_then_submit_and_land() {
+    // A, B, C, then A, C, B: locally and in the file.
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+    let main = env.branch("main").unwrap();
+    env.jj(&["rebase", "-r", &groups[2][0], "-d", &groups[0][0]]);
+    env.jj(&["rebase", "-s", &groups[1][0], "-d", &groups[2][0]]);
+    let mut file = stack.read();
+    file["prs"].as_array_mut().unwrap().swap(1, 2);
+    stack.write(file);
+
+    stack.spr("submit", &["-m", "reorder"]);
+    assert_eq!(stack.prs(), vec![prs[0], prs[2], prs[1]]);
+    env.check_pr(prs[0], "main", &["a.txt"], &groups[0][0]);
+    env.check_pr(prs[2], &env.pr(prs[0]).head_ref, &["c.txt"], &groups[2][0]);
+    env.check_pr(
+        prs[1],
+        &env.pr(prs[2]).head_ref,
+        &["b1.txt", "b2.txt", "b3.txt"],
+        &groups[1][2],
+    );
+    assert_eq!(env.active_stacks(), vec![vec![prs[0], prs[2], prs[1]]]);
+
+    stack.spr("land", &[]);
+    for &number in &prs {
+        assert!(env.pr(number).merged_at.is_some(), "#{number} merged");
+    }
+    let subjects: Vec<String> = main_commits(&env, &main)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(subjects, vec!["Title of A", "Title of C", "Title of B"]);
+    for file in ["a.txt", "b1.txt", "b2.txt", "b3.txt", "c.txt"] {
+        env.remote_git(&["cat-file", "-e", &format!("main:{file}")]);
+    }
+    stack.spr("sync", &[]);
+    for i in 0..3 {
+        assert_eq!(stack.entry(i)["merged"], true, "{}", stack.entry(i));
+    }
+}

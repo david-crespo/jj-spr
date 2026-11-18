@@ -16,6 +16,8 @@
 //! reverts what landed in between. It never rebases merely because the main
 //! branch moved; `jj rebase` owns that.
 
+use std::path::{Path, PathBuf};
+
 use git2::Oid;
 
 use crate::{
@@ -23,6 +25,7 @@ use crate::{
     github::PullRequestState,
     jj::{PreparedCommit, short},
     output::output,
+    stack_file::StackFile,
 };
 
 #[derive(Debug, clap::Parser)]
@@ -36,6 +39,10 @@ pub struct SyncOptions {
     /// fetched)
     #[clap(long)]
     dry_run: bool,
+
+    /// A stack file: sync its entries and mark the merged ones
+    #[clap(value_name = "STACK_FILE", conflicts_with = "revision")]
+    file: Option<PathBuf>,
 }
 
 /// What `sync` found for one local change.
@@ -87,6 +94,9 @@ pub async fn sync(
     output("🔄", &format!("Fetching from {}", config.remote_name))?;
     jj.run(["git", "fetch", "--remote", &config.remote_name])?;
 
+    if let Some(path) = &opts.file {
+        return sync_stack_file(&opts, path, jj, gh, config).await;
+    }
     let commits = jj.get_prepared_commits_from_to(config, &trunk, target, false)?;
     if commits.is_empty() {
         output(
@@ -95,6 +105,72 @@ pub async fn sync(
         )?;
         return Ok(());
     }
+    sync_commits(&opts, jj, gh, config, commits, "`jj spr diff --all`")
+        .await
+        .map(|_| ())
+}
+
+/// Sync a stack file's entries, and mark the ones that merged.
+async fn sync_stack_file(
+    opts: &SyncOptions,
+    path: &Path,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let mut file = StackFile::read(path)?;
+    let name = path.display().to_string();
+    let indices = file.active(None)?;
+    if indices.is_empty() {
+        output("👋", "Every entry has merged. Nothing to sync.")?;
+        return Ok(());
+    }
+    // Problems with the changes themselves don't matter here, as long as
+    // every entry's changes are known.
+    let (resolved, problems) = crate::stack_file::resolve(jj, config, &file, &indices)?;
+    if resolved.iter().any(|r| r.members.is_empty()) {
+        return Err(Error::new(format!(
+            "Not syncing: {}",
+            crate::stack_file::describe_problems(&name, &problems)
+        )));
+    }
+    let commits = resolved
+        .iter()
+        .map(|r| r.planned(file.prs[r.index].pr))
+        .collect();
+    let resubmit = format!("`jj spr submit {name}`");
+    let merged = sync_commits(opts, jj, gh, config, commits, &resubmit).await?;
+    if merged.is_empty() {
+        return Ok(());
+    }
+    for entry in file.prs.iter_mut() {
+        if entry.pr.is_some_and(|n| merged.contains(&n)) {
+            entry.merged = true;
+        }
+    }
+    file.write(path)?;
+    output(
+        "📝",
+        &format!(
+            "Marked {} merged in {name}",
+            crate::stacks::format_pr_list(&merged)
+        ),
+    )
+}
+
+/// Sync `commits`, the planned Pull Requests between the main branch and the
+/// top of the stack, bottom first. `resubmit` is the command that updates
+/// the remaining Pull Requests. Returns the merged Pull Requests whose
+/// changes were abandoned.
+async fn sync_commits(
+    opts: &SyncOptions,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+    commits: Vec<PreparedCommit>,
+    resubmit: &str,
+) -> Result<Vec<u64>> {
+    let trunk = config.trunk_revset();
     jj.require_linear(&commits, "syncing")?;
 
     let change_ids = jj.change_ids_for(&commits)?;
@@ -172,7 +248,8 @@ pub async fn sync(
         .filter(|c| !matches!(c.status, Status::Merged(_)))
         .collect();
     if merged.is_empty() {
-        return rebase_onto_newer_main(&opts, jj, config, &remaining);
+        rebase_onto_newer_main(opts, jj, config, &remaining, resubmit)?;
+        return Ok(Vec::new());
     }
 
     if opts.dry_run {
@@ -188,7 +265,7 @@ pub async fn sync(
                 ),
             )?;
         }
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // Rebase before abandoning. Abandoning first would move what is left onto
@@ -210,11 +287,19 @@ pub async fn sync(
         output("🗑️ ", &format!("Abandoned {} (#{number})", ids.join(", ")))?;
     }
 
+    let numbers = merged
+        .iter()
+        .filter_map(|c| match c.status {
+            Status::Merged(n) => Some(n),
+            _ => None,
+        })
+        .collect();
     if remaining.is_empty() {
         output("🎉", "Every change in this stack has merged.")?;
-        return Ok(());
+        return Ok(numbers);
     }
-    check_rebased(jj, &trunk, &remaining)
+    check_rebased(jj, &trunk, &remaining, resubmit)?;
+    Ok(numbers)
 }
 
 /// Nothing merged: rebase the stack only if GitHub already moved its bottom
@@ -224,6 +309,7 @@ fn rebase_onto_newer_main(
     jj: &crate::jj::Jujutsu,
     config: &crate::config::Config,
     remaining: &[&Change],
+    resubmit: &str,
 ) -> Result<()> {
     let trunk = config.trunk_revset();
     let moved = match remaining.first() {
@@ -261,7 +347,7 @@ fn rebase_onto_newer_main(
         return Ok(());
     }
     rebase_onto_main(jj, &trunk, root, remaining.len())?;
-    check_rebased(jj, &trunk, remaining)
+    check_rebased(jj, &trunk, remaining, resubmit)
 }
 
 /// Rebase `root` and its descendants (`count` changes) onto the main branch.
@@ -277,7 +363,12 @@ fn rebase_onto_main(
 
 /// After rebasing `remaining` (bottom first): stop on conflicts, or say what
 /// to do next.
-fn check_rebased(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) -> Result<()> {
+fn check_rebased(
+    jj: &crate::jj::Jujutsu,
+    trunk: &str,
+    remaining: &[&Change],
+    resubmit: &str,
+) -> Result<()> {
     let Some(top) = remaining.last() else {
         return Ok(());
     };
@@ -285,7 +376,7 @@ fn check_rebased(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) ->
     if !conflicted.is_empty() {
         return Err(Error::new(format!(
             "The rebase left conflicts in:\n{conflicted}\nResolve them (for example with \
-             `jj resolve`) before running `jj spr diff --all`, or undo the sync with `jj undo`.",
+             `jj resolve`) before running {resubmit}, or undo the sync with `jj undo`.",
         )));
     }
 
@@ -295,7 +386,7 @@ fn check_rebased(jj: &crate::jj::Jujutsu, trunk: &str, remaining: &[&Change]) ->
     {
         output(
             "👉",
-            "Run `jj spr diff --all` to update the remaining Pull Requests.",
+            &format!("Run {resubmit} to update the remaining Pull Requests."),
         )?;
     }
     Ok(())

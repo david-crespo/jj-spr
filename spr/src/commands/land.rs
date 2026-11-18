@@ -6,13 +6,19 @@
  */
 
 use indoc::formatdoc;
-use std::{io::Write, process::Stdio, time::Duration};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use crate::{
     error::{Error, Result, ResultExt},
     github::{PullRequestState, PullRequestUpdate},
     message::build_github_body_for_merging,
     output::{output, write_commit_title},
+    stack_file::StackFile,
     utils::run_command,
 };
 
@@ -33,6 +39,15 @@ pub struct LandOptions {
     /// asking (required when not running in a terminal)
     #[clap(long, short = 'y')]
     yes: bool,
+
+    /// A stack file whose Pull Requests to land
+    #[clap(value_name = "STACK_FILE", conflicts_with = "revision")]
+    file: Option<PathBuf>,
+
+    /// With a stack file, land only the entries up to and including the one
+    /// with this tip
+    #[clap(long, value_name = "TIP", requires = "file")]
+    upto: Option<String>,
 }
 
 pub async fn land(
@@ -41,6 +56,9 @@ pub async fn land(
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
+    if let Some(path) = &opts.file {
+        return land_stack_file(path, opts.upto.as_deref(), jj, gh, config).await;
+    }
     let revision = opts.revision.as_deref().unwrap_or("@");
     let prepared_commit = jj.get_prepared_commit_for_revision(config, revision)?;
 
@@ -58,7 +76,110 @@ pub async fn land(
     } else {
         return Err(Error::new("This commit does not refer to a Pull Request."));
     };
+    land_pull_request(
+        pull_request_number,
+        opts.yes,
+        "`jj spr sync`",
+        jj,
+        gh,
+        config,
+    )
+    .await
+}
 
+/// Land the Pull Requests of a stack file's entries, bottom first, up to the
+/// one with tip `upto`. In a GitHub stack, that is one landing of the top
+/// one, which merges the ones below it; the stack has to have exactly those
+/// below it. Without one, each lands on its own.
+async fn land_stack_file(
+    path: &Path,
+    upto: Option<&str>,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let file = StackFile::read(path)?;
+    let name = path.display();
+    let sync = format!("`jj spr sync {name}`");
+    let numbers = file
+        .active(upto)?
+        .into_iter()
+        .map(|i| {
+            let entry = &file.prs[i];
+            entry.pr.ok_or_else(|| {
+                Error::new(format!(
+                    "'{}' has no Pull Request yet. Run `jj spr submit {name}` first.",
+                    entry.tip
+                ))
+            })
+        })
+        .collect::<Result<Vec<u64>>>()?;
+    let Some((&top, below)) = numbers.split_last() else {
+        output("👋", "Every entry has merged. Nothing to land.")?;
+        return Ok(());
+    };
+    let merged: Vec<u64> = gh
+        .get_pull_requests(numbers.iter().map(|&n| Some(n)))
+        .await?
+        .into_iter()
+        .flatten()
+        .filter(|pr| pr.state == PullRequestState::Merged)
+        .map(|pr| pr.number)
+        .collect();
+    if !merged.is_empty() {
+        return Err(Error::new(format!(
+            "Not landing: {} merged already. Run {sync} first.",
+            format_or_nothing(&merged)
+        )));
+    }
+    match gh.stack_containing(top).await? {
+        Some(stack) => {
+            let stacked: Vec<u64> = stack
+                .active_pull_requests()
+                .into_iter()
+                .take_while(|n| *n != top)
+                .collect();
+            if stacked != below {
+                return Err(Error::new(format!(
+                    "Not landing: below #{top}, GitHub stack #{} has {}, but {name} has {}. \
+                     Run `jj spr submit {name}` to bring GitHub up to date.",
+                    stack.number,
+                    format_or_nothing(&stacked),
+                    format_or_nothing(below),
+                )));
+            }
+            output("#️⃣ ", &format!("Pull Request #{top}"))?;
+            land_pull_request(top, true, &sync, jj, gh, config).await
+        }
+        None => {
+            for &number in &numbers {
+                output("#️⃣ ", &format!("Pull Request #{number}"))?;
+                land_pull_request(number, true, &sync, jj, gh, config).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn format_or_nothing(numbers: &[u64]) -> String {
+    if numbers.is_empty() {
+        "nothing".to_string()
+    } else {
+        crate::stacks::format_pr_list(numbers)
+    }
+}
+
+/// Land Pull Request `pull_request_number`, with every open Pull Request
+/// below it in its GitHub stack. `yes` merges those without asking. `sync`
+/// is the command to run afterwards.
+async fn land_pull_request(
+    pull_request_number: u64,
+    yes: bool,
+    sync: &str,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
     // Load Pull Request information
     let pull_request = gh.get_pull_request(pull_request_number).await?;
 
@@ -162,7 +283,7 @@ pub async fn land(
                     stack.number
                 ),
             )?;
-            confirm_merging_below(&opts, &below)?;
+            confirm_merging_below(yes, &below)?;
         }
     }
 
@@ -346,8 +467,7 @@ pub async fn land(
         }
         output(
             "👉",
-            "Run `jj spr sync` to abandon the landed change and rebase the rest \
-             of the stack",
+            &format!("Run {sync} to abandon the landed changes and rebase the rest of the stack"),
         )?;
     }
 
@@ -509,9 +629,9 @@ fn check_landable(
 
 /// Landing a Pull Request above the bottom of a stack merges the ones below
 /// it too; make sure that is intended.
-fn confirm_merging_below(opts: &LandOptions, below: &[u64]) -> Result<()> {
+fn confirm_merging_below(yes: bool, below: &[u64]) -> Result<()> {
     use std::io::IsTerminal;
-    if opts.yes {
+    if yes {
         return Ok(());
     }
     let list = crate::stacks::format_pr_list(below);

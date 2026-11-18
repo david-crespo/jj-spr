@@ -5,7 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::process::Stdio;
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use indoc::formatdoc;
 
@@ -15,11 +18,13 @@ use crate::{
     jj::PreparedCommit,
     message::MessageSection,
     output::{output, write_commit_title},
+    stack_file::StackFile,
 };
 
 #[derive(Debug, clap::Parser)]
 pub struct CloseOptions {
-    /// Close Pull Requests for commits in range from base to revision
+    /// Close Pull Requests for commits in range from base to revision. With a
+    /// stack file, close the Pull Request of every entry.
     #[clap(long, short = 'a')]
     all: bool,
 
@@ -31,6 +36,21 @@ pub struct CloseOptions {
     /// If a range is provided, behaves like --all mode. If not specified, uses '@-'.
     #[clap(short = 'r', long)]
     revision: Option<String>,
+
+    /// A stack file: close one entry's Pull Request (--pr) or every entry's
+    /// (--all, top first). The entries stay, without their pr, synced, and
+    /// pushed keys, so a later jj spr submit opens new Pull Requests.
+    #[clap(value_name = "STACK_FILE", conflicts_with_all = ["revision", "base"])]
+    file: Option<PathBuf>,
+
+    /// With a stack file, the tip of the entry whose Pull Request to close
+    #[clap(
+        long = "pr",
+        value_name = "TIP",
+        requires = "file",
+        conflicts_with = "all"
+    )]
+    pr_tip: Option<String>,
 }
 
 pub async fn close(
@@ -39,6 +59,9 @@ pub async fn close(
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
+    if let Some(path) = &opts.file {
+        return close_stack_file(&opts, path, jj, gh, config).await;
+    }
     let mut result = Ok(());
 
     // Determine revision and whether to use range mode
@@ -89,6 +112,52 @@ pub async fn close(
     result
 }
 
+/// Close the Pull Requests of a stack file's entries, and clear their `pr`,
+/// `synced`, and `pushed`.
+async fn close_stack_file(
+    opts: &CloseOptions,
+    path: &Path,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let mut file = StackFile::read(path)?;
+    let targets: Vec<usize> = match (&opts.pr_tip, opts.all) {
+        (Some(tip), _) => {
+            let index = file.find(tip)?;
+            if file.prs[index].pr.is_none() || file.prs[index].merged {
+                return Err(Error::new(format!(
+                    "'{tip}' has no open Pull Request to close."
+                )));
+            }
+            vec![index]
+        }
+        (None, true) => (0..file.prs.len())
+            .filter(|&i| file.prs[i].pr.is_some() && !file.prs[i].merged)
+            .collect(),
+        (None, false) => {
+            return Err(Error::new(
+                "With a stack file, pass --pr <tip> to close one entry's Pull Request, or \
+                 --all to close every one.",
+            ));
+        }
+    };
+    let selection: Vec<u64> = targets.iter().filter_map(|&i| file.prs[i].pr).collect();
+    let resubmit = format!("`jj spr submit {}`", path.display());
+    // Top first: deleting a branch closes the Pull Requests that target it.
+    for index in targets.into_iter().rev() {
+        let entry = &mut file.prs[index];
+        let number = entry.pr.expect("only entries with a Pull Request");
+        output("📄", &entry.tip)?;
+        close_pull_request(jj, gh, config, number, &selection, Some(&resubmit)).await?;
+        entry.pr = None;
+        entry.synced = None;
+        entry.pushed = None;
+        file.write(path)?;
+    }
+    Ok(())
+}
+
 async fn close_impl(
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
@@ -96,12 +165,31 @@ async fn close_impl(
     prepared_commit: &mut PreparedCommit,
     selection: &[u64],
 ) -> Result<()> {
-    let pull_request_number = if let Some(number) = prepared_commit.pull_request_number {
-        output("#️⃣ ", &format!("Pull Request #{}", number))?;
-        number
-    } else {
+    let Some(pull_request_number) = prepared_commit.pull_request_number else {
         return Err(Error::new("This commit does not refer to a Pull Request."));
     };
+    close_pull_request(jj, gh, config, pull_request_number, selection, None).await?;
+
+    // Remove sections from commit that are not relevant after closing.
+    prepared_commit.message.remove(&MessageSection::PullRequest);
+    prepared_commit.message.remove(&MessageSection::ReviewedBy);
+    prepared_commit.message_changed = true;
+    Ok(())
+}
+
+/// Close Pull Request `pull_request_number` and delete its branch, unless
+/// another open Pull Request outside `selection` (the ones this run closes)
+/// targets it. `resubmit` is the command that restacks those, for a stack
+/// file.
+async fn close_pull_request(
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+    pull_request_number: u64,
+    selection: &[u64],
+    resubmit: Option<&str>,
+) -> Result<()> {
+    output("#️⃣ ", &format!("Pull Request #{}", pull_request_number))?;
 
     // Load Pull Request information
     let pull_request = gh.clone().get_pull_request(pull_request_number).await?;
@@ -136,11 +224,6 @@ async fn close_impl(
     };
 
     output("📕", "Closed!")?;
-
-    // Remove sections from commit that are not relevant after closing.
-    prepared_commit.message.remove(&MessageSection::PullRequest);
-    prepared_commit.message.remove(&MessageSection::ReviewedBy);
-    prepared_commit.message_changed = true;
 
     // Keep branches that other open Pull Requests still use: GitHub closes a
     // Pull Request whose base branch is deleted, and a natively stacked Pull
@@ -180,11 +263,14 @@ async fn close_impl(
         } else {
             ("target", "those changes", "them")
         };
+        let restack = match resubmit {
+            Some(resubmit) => format!("Run {resubmit} to restack {them}."),
+            None => format!("Rebase {changes} and run `jj spr diff --all` to restack {them}."),
+        };
         output(
             "⚠️",
             &format!(
-                "Keeping branch {} because {} still {targets} it. Rebase \
-                 {changes} and run `jj spr diff --all` to restack {them}.",
+                "Keeping branch {} because {} still {targets} it. {restack}",
                 pull_request.head.branch_name(),
                 crate::stacks::format_pr_list(&dependents),
             ),
