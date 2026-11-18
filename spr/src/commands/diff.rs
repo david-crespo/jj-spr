@@ -765,11 +765,21 @@ async fn lookup_parent_pull_request(
         ))
     })?;
     let pull_request = gh.get_pull_request(number).await?;
-    if pull_request.state != PullRequestState::Open {
-        return Err(Error::new(formatdoc!(
-            "The parent change's Pull Request #{number} is closed. Rebase this \
-             change before submitting it.",
-        )));
+    match pull_request.state {
+        PullRequestState::Open => {}
+        PullRequestState::Merged => {
+            return Err(Error::new(formatdoc!(
+                "The parent change's Pull Request #{number} has merged. Run `jj \
+                 spr sync` to abandon the merged change and rebase this one, then \
+                 run `jj spr diff` again.",
+            )));
+        }
+        PullRequestState::Closed => {
+            return Err(Error::new(formatdoc!(
+                "The parent change's Pull Request #{number} is closed. Rebase this \
+                 change before submitting it.",
+            )));
+        }
     }
     Ok(ParentPullRequest {
         number: Some(number),

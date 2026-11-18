@@ -471,6 +471,49 @@ fn stacks_disabled() {
 }
 
 #[test]
+fn land_refuses_a_chained_pull_request_without_a_stack() {
+    let env = TestEnv::with_stacks(false);
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    let bases: Vec<String> = prs.iter().map(|&n| env.pr(n).base_ref).collect();
+
+    let out = env.try_spr(&["land", "-r", &changes[1]]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!("Land #{} first", prs[0])),
+        "{}",
+        out.text
+    );
+    assert!(
+        env.gh.state().prs.values().all(|pr| pr.merged_at.is_none()),
+        "nothing should merge"
+    );
+    let after: Vec<String> = prs.iter().map(|&n| env.pr(n).base_ref).collect();
+    assert_eq!(after, bases, "bases must be unchanged");
+}
+
+#[test]
+fn land_a_legacy_pull_request_with_a_base_branch() {
+    let env = TestEnv::new();
+    let changes = vec![
+        env.commit("Change A", "a.txt", "a\n"),
+        env.commit("Change B", "b.txt", "b\n"),
+    ];
+    env.spr(&["diff", "--all", "--no-native-stack", "-m", "legacy"]);
+    let prs = env.prs_for(&changes);
+    let base = env.pr(prs[1]).base_ref;
+    assert!(base.starts_with("spr/main."), "legacy base was {base}");
+
+    env.spr(&["land", "-r", &changes[0]]);
+    env.spr(&["land", "-r", &changes[1]]);
+    assert!(env.pr(prs[1]).merged_at.is_some(), "B should be merged");
+    assert!(
+        env.branch(&base).is_none(),
+        "the base branch should be deleted"
+    );
+}
+
+#[test]
 fn github_rebase_after_merge_keeps_edits_in_merge_commits() {
     // Amending a change and the one below it in one run gives the upper PR
     // an update commit that is a merge carrying its own edit. GitHub's
@@ -528,6 +571,37 @@ fn land_reports_branch_it_could_not_delete() {
         out.text
     );
     assert!(env.branch(&branch).is_some());
+}
+
+#[test]
+fn land_keeps_branches_when_open_pull_requests_cannot_be_listed() {
+    // Without a stack nothing but jj-spr's cleanup moves B off A's branch,
+    // and deleting that branch would close B.
+    let env = TestEnv::with_stacks(false);
+    let changes = env.build_stack(&["a", "b"]);
+    let prs = env.prs_for(&changes);
+    let branch = env.pr(prs[0]).head_ref;
+    env.gh
+        .state()
+        .failing_queries
+        .push("OpenPullRequestBranchesQuery".into());
+
+    let out = env.spr(&["land", "-r", &changes[0]]);
+    assert!(env.pr(prs[0]).merged_at.is_some(), "A should be merged");
+    let text = out.flat();
+    assert!(
+        text.contains("Could not list the open Pull Requests"),
+        "{}",
+        out.text
+    );
+    assert!(text.contains(&branch), "{}", out.text);
+    assert!(env.branch(&branch).is_some(), "A's branch was deleted");
+    let dependent = env.pr(prs[1]);
+    assert!(
+        dependent.is_open(),
+        "B was closed: {:?}",
+        dependent.closed_reason
+    );
 }
 
 #[test]

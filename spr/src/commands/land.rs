@@ -101,11 +101,26 @@ pub async fn land(
 
     // A Pull Request in a native GitHub stack is merged through GitHub's
     // stack-aware merge, which merges every Pull Request below it too.
-    let stack = gh
-        .stack_containing(pull_request_number)
-        .await
-        .ok()
-        .flatten();
+    let stack = gh.stack_containing(pull_request_number).await?;
+    // Without a stack, a Pull Request based on another open Pull Request's
+    // branch would be squash-merged together with everything below it.
+    if !base_is_master && stack.is_none() {
+        let base = pull_request.base.branch_name();
+        if let Some(below) = gh
+            .get_open_pull_requests()
+            .await?
+            .into_iter()
+            .find(|pr| pr.head_ref_name == base)
+        {
+            return Err(Error::new(format!(
+                "Pull Request #{pull_request_number} targets {base}, the branch of \
+                 open Pull Request #{below}, and is not in a GitHub stack, so landing \
+                 it would merge both as one commit. Land #{below} first.",
+                below = below.number
+            )));
+        }
+    }
+
     // The Pull Requests below this one that merge with it, bottom first.
     let mut merged_below = Vec::new();
     if let Some(stack) = &stack {
@@ -330,66 +345,87 @@ pub async fn land(
         .map(|pr| pr.number)
         .chain([pull_request_number])
         .collect();
-    let open_pull_requests: Vec<_> = gh
-        .get_open_pull_requests()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|pr| !merged_numbers.contains(&pr.number))
-        .collect();
-    let mut kept_heads = Vec::new();
-    for dependent in open_pull_requests.iter() {
-        let Some(head) = merged_heads
-            .iter()
-            .find(|head| dependent.base_ref_name == head.branch_name())
-        else {
-            continue;
-        };
-        let retarget = gh
-            .update_pull_request(
-                dependent.number,
-                PullRequestUpdate {
-                    base: Some(config.master_ref.branch_name().to_string()),
-                    ..Default::default()
-                },
-            )
-            .await;
-        match retarget {
-            Ok(()) => output(
-                "↪️ ",
-                &format!(
-                    "Pull Request #{} now targets {}",
-                    dependent.number,
-                    config.master_ref.branch_name()
-                ),
-            )?,
-            Err(_) => {
-                kept_heads.push(head.branch_name().to_string());
+    // A legacy base branch made by jj-spr for this Pull Request.
+    let legacy_base = (!base_is_master && stack.is_none()).then_some(&pull_request.base);
+    let branches_to_delete: Vec<&crate::github::GitHubBranch> =
+        match gh.get_open_pull_requests().await {
+            Ok(open_pull_requests) => {
+                let open_pull_requests: Vec<_> = open_pull_requests
+                    .into_iter()
+                    .filter(|pr| !merged_numbers.contains(&pr.number))
+                    .collect();
+                let mut kept_heads = Vec::new();
+                for dependent in open_pull_requests.iter() {
+                    let Some(head) = merged_heads
+                        .iter()
+                        .find(|head| dependent.base_ref_name == head.branch_name())
+                    else {
+                        continue;
+                    };
+                    let retarget = gh
+                        .update_pull_request(
+                            dependent.number,
+                            PullRequestUpdate {
+                                base: Some(config.master_ref.branch_name().to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    match retarget {
+                        Ok(()) => output(
+                            "↪️ ",
+                            &format!(
+                                "Pull Request #{} now targets {}",
+                                dependent.number,
+                                config.master_ref.branch_name()
+                            ),
+                        )?,
+                        Err(_) => {
+                            kept_heads.push(head.branch_name().to_string());
+                            output(
+                                "⚠️",
+                                &format!(
+                                    "Pull Request #{} still targets {}; keeping that branch",
+                                    dependent.number,
+                                    head.branch_name()
+                                ),
+                            )?;
+                        }
+                    }
+                }
+                let used_elsewhere = |branch: &str| {
+                    open_pull_requests
+                        .iter()
+                        .any(|pr| pr.head_ref_name == branch || pr.base_ref_name == branch)
+                };
+                merged_heads
+                    .iter()
+                    .copied()
+                    .filter(|head| !kept_heads.iter().any(|kept| kept == head.branch_name()))
+                    .chain(legacy_base.filter(|base| !used_elsewhere(base.branch_name())))
+                    .collect()
+            }
+            // Without the list, a branch that another Pull Request targets
+            // cannot be told apart from an unused one, and deleting it would
+            // close that Pull Request.
+            Err(error) => {
+                let kept: Vec<&str> = merged_heads
+                    .iter()
+                    .copied()
+                    .chain(legacy_base)
+                    .map(|branch| branch.branch_name())
+                    .collect();
                 output(
                     "⚠️",
                     &format!(
-                        "Pull Request #{} still targets {}; keeping that branch",
-                        dependent.number,
-                        head.branch_name()
+                        "Could not list the open Pull Requests, so keeping {} in case \
+                         another Pull Request targets them: {error}",
+                        kept.join(", ")
                     ),
                 )?;
+                Vec::new()
             }
-        }
-    }
-    let used_elsewhere = |branch: &str| {
-        open_pull_requests
-            .iter()
-            .any(|pr| pr.head_ref_name == branch || pr.base_ref_name == branch)
-    };
-
-    let mut branches_to_delete: Vec<&crate::github::GitHubBranch> = merged_heads
-        .iter()
-        .copied()
-        .filter(|head| !kept_heads.iter().any(|kept| kept == head.branch_name()))
-        .collect();
-    if !base_is_master && stack.is_none() && !used_elsewhere(pull_request.base.branch_name()) {
-        branches_to_delete.push(&pull_request.base);
-    }
+        };
     let mut delete_branch_processes = Vec::new();
     for branch in branches_to_delete {
         delete_branch_processes.push((

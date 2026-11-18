@@ -345,6 +345,26 @@ fn diff_range_above_a_closed_parent_keeps_the_stack() {
 }
 
 #[test]
+fn diff_of_a_change_whose_parent_merged_points_at_sync() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    env.gh.state().merge_on_github(prs[0]);
+    let before = heads(&env, &prs[1..]);
+
+    let out = env.try_spr(&["diff", "-r", &changes[1], "-m", "before sync"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!("#{} has merged", prs[0])),
+        "{}",
+        out.text
+    );
+    assert!(text.contains("jj spr sync"), "{}", out.text);
+    assert_eq!(heads(&env, &prs[1..]), before, "nothing may be pushed");
+}
+
+#[test]
 fn diff_of_one_stacked_change_refuses_a_base_change_before_pushing() {
     // papertigers/jj-spr#22: single-change mode pushed B, then failed to
     // change its base, which GitHub refuses for a PR in a stack.

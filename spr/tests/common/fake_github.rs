@@ -115,6 +115,8 @@ pub struct State {
     /// GitHub's, they belong to a head commit, so pushing clears them.
     pub checks: HashMap<String, Vec<(String, String)>>,
     merge_ops: HashMap<u64, MergeOperation>,
+    /// GraphQL operations (by name) that answer with an error.
+    pub failing_queries: Vec<String>,
     pub requests: Vec<Recorded>,
     /// Pull requests and stacks share one sequence of numbers, as on GitHub.
     next_number: u64,
@@ -1007,6 +1009,9 @@ impl State {
     fn graphql(&self, body: &Value) -> Value {
         let name = body["operationName"].as_str().unwrap_or_default();
         let variables = &body["variables"];
+        if self.failing_queries.iter().any(|q| q == name) {
+            return json!({"errors": [{"message": format!("fake github: {name} failed")}]});
+        }
         match name {
             "PullRequestQuery" | "PullRequestMergeabilityQuery" => {
                 let data = variables["number"]
@@ -1086,6 +1091,7 @@ impl FakeGitHub {
             stacks: BTreeMap::new(),
             checks: HashMap::new(),
             merge_ops: HashMap::new(),
+            failing_queries: Vec::new(),
             requests: Vec::new(),
             next_number: 1,
         }));
