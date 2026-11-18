@@ -106,6 +106,102 @@ fn non_blank(text: &str) -> std::result::Result<String, String> {
     Ok(text.to_string())
 }
 
+impl DiffOptions {
+    fn push_options(&self) -> PushOptions {
+        PushOptions {
+            update_message: self.update_message,
+            draft: self.draft,
+            message: self.message.clone(),
+            cherry_pick: self.cherry_pick,
+            no_cherry_pick: self.no_cherry_pick,
+            dry_run: self.dry_run,
+            discard_remote_changes: self.discard_remote_changes,
+        }
+    }
+}
+
+/// The options `publish` takes from the command line, for `diff` and
+/// `submit`.
+#[derive(Debug, Default)]
+pub(crate) struct PushOptions {
+    pub update_message: bool,
+    pub draft: bool,
+    /// The message for commits that update a Pull Request. Without it,
+    /// `publish` asks for one.
+    pub message: Option<String>,
+    pub cherry_pick: bool,
+    pub no_cherry_pick: bool,
+    pub dry_run: bool,
+    pub discard_remote_changes: bool,
+}
+
+/// What a front end sets for one Pull Request in place of what `publish`
+/// works out from the top change's description: the title and body the Pull
+/// Request should have on GitHub, and the branch for a new one.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Overrides {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub branch: Option<String>,
+}
+
+/// Where `publish` records what it did.
+pub(crate) trait Record {
+    /// The new Pull Request at `index` is about to be pushed to `branch` for
+    /// the first time.
+    fn pushing(&mut self, _index: usize, _branch: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// The Pull Request at `index` was published: created, updated, or
+    /// found up to date. `number` is `None` for one that a dry run would
+    /// create.
+    fn published(
+        &mut self,
+        index: usize,
+        commit: &mut crate::jj::PreparedCommit,
+        number: Option<u64>,
+    ) -> Result<()>;
+
+    /// Publishing finished, or stopped at an error.
+    fn finish(&mut self, commits: &mut [crate::jj::PreparedCommit]) -> Result<()>;
+}
+
+/// `diff`'s record: a `Pull Request:` line in each change of a new Pull
+/// Request, written with `jj describe` at the end of the run.
+struct Descriptions<'a> {
+    jj: &'a crate::jj::Jujutsu,
+    config: &'a crate::config::Config,
+    dry_run: bool,
+}
+
+impl Record for Descriptions<'_> {
+    fn published(
+        &mut self,
+        _index: usize,
+        commit: &mut crate::jj::PreparedCommit,
+        number: Option<u64>,
+    ) -> Result<()> {
+        if let Some(number) = number
+            && commit.pull_request_number.is_none()
+        {
+            commit.message.insert(
+                MessageSection::PullRequest,
+                self.config.pull_request_url(number),
+            );
+            commit.message_changed = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, commits: &mut [crate::jj::PreparedCommit]) -> Result<()> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.jj.rewrite_commit_messages(self.config, commits)
+    }
+}
+
 /// The Pull Request branch of a change's parent, which the change's Pull
 /// Request targets.
 #[derive(Debug, Clone)]
@@ -227,7 +323,7 @@ fn resolve_cherry_pick(
 /// reviewer. `diff` does this for every change before it changes anything on
 /// GitHub.
 async fn resolve_change(
-    opts: &DiffOptions,
+    opts: &PushOptions,
     jj: &crate::jj::Jujutsu,
     config: &crate::config::Config,
     commit: &crate::jj::PreparedCommit,
@@ -348,13 +444,11 @@ async fn resolve_change(
 }
 
 pub async fn diff(
-    mut opts: DiffOptions,
+    opts: DiffOptions,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
 ) -> Result<()> {
-    let mut result = Ok(());
-
     // With --tips, the range runs from the base up to the topmost tip, as
     // with --all.
     let tips = opts
@@ -406,7 +500,7 @@ pub async fn diff(
         jj.get_master_base_for_commit(config, first_commit.oid)?
     } else {
         output("👋", "No commits found - nothing to do. Good bye!")?;
-        return result;
+        return Ok(());
     };
 
     // A conflicted change would be pushed as jj's conflict files.
@@ -426,7 +520,7 @@ pub async fn diff(
 
     refuse_unreadable_pull_request_lines(jj, config, &prepared_commits)?;
 
-    let mut pull_requests = gh
+    let pull_requests = gh
         .get_pull_requests(prepared_commits.iter().map(|pc| pc.pull_request_number))
         .await?;
 
@@ -471,9 +565,55 @@ pub async fn diff(
         )));
     }
 
+    // --title and --body are for a run with one Pull Request.
+    let overrides = vec![
+        Overrides {
+            title: opts.title.clone(),
+            body: opts.body.clone(),
+            branch: None,
+        };
+        prepared_commits.len()
+    ];
+    let mut record = Descriptions {
+        jj,
+        config,
+        dry_run: opts.dry_run,
+    };
+    publish(
+        &mut opts.push_options(),
+        jj,
+        gh,
+        config,
+        &mut prepared_commits,
+        &overrides,
+        pull_requests,
+        master_base_oid,
+        &mut record,
+    )
+    .await
+}
+
+/// Publish `commits`, a line of planned Pull Requests (bottom first), with
+/// `pull_requests` the existing ones among them: check everything that can
+/// stop the run, then push and create or update each one, bottom first, and
+/// register them as a GitHub stack. `overrides` has an entry for each one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish(
+    opts: &mut PushOptions,
+    jj: &crate::jj::Jujutsu,
+    gh: &mut crate::github::GitHub,
+    config: &crate::config::Config,
+    prepared_commits: &mut [crate::jj::PreparedCommit],
+    overrides: &[Overrides],
+    mut pull_requests: Vec<Option<PullRequest>>,
+    master_base_oid: Oid,
+    record: &mut dyn Record,
+) -> Result<()> {
+    let mut result = Ok(());
+
     let mut resolved = Vec::with_capacity(prepared_commits.len());
-    for commit in &prepared_commits {
-        resolved.push(resolve_change(&opts, jj, config, commit, master_base_oid).await?);
+    for commit in prepared_commits.iter() {
+        resolved.push(resolve_change(opts, jj, config, commit, master_base_oid).await?);
     }
 
     // Everything below compares against the Pull Requests' heads as fetched;
@@ -499,7 +639,7 @@ pub async fn diff(
     if !opts.discard_remote_changes {
         let mut changed_remotely = Vec::new();
         for ((commit, pull_request), resolved) in
-            zip(zip(&prepared_commits, &pull_requests), &resolved)
+            zip(zip(prepared_commits.iter(), &pull_requests), &resolved)
         {
             if let Some(pr) = pull_request
                 && pr.state == PullRequestState::Open
@@ -545,7 +685,7 @@ pub async fn diff(
     if let Some(stacks) = gh.list_stacks().await? {
         let planned = plan_native_bases(
             config,
-            &prepared_commits,
+            prepared_commits,
             &pull_requests,
             &resolved,
             outside_parent.as_ref(),
@@ -646,8 +786,8 @@ pub async fn diff(
         .collect();
     let mut parent = outside_parent;
 
-    for ((prepared_commit, pull_request), resolved) in
-        zip(zip(prepared_commits.iter_mut(), pull_requests), resolved)
+    for (index, ((prepared_commit, pull_request), resolved)) in
+        zip(zip(prepared_commits.iter_mut(), pull_requests), resolved).enumerate()
     {
         if result.is_err() {
             break;
@@ -668,13 +808,15 @@ pub async fn diff(
         // with all the changes that the implementation makes at the end, even if
         // the implementation encounters an error or exits early.
         let outcome = diff_impl(
-            &opts,
+            opts,
             &mut message_on_prompt,
             jj,
             gh,
             config,
             prepared_commit,
             resolved,
+            &overrides[index],
+            &mut |branch: &str| record.pushing(index, branch),
             master_base_oid,
             pull_request,
             &mut taken_branches,
@@ -688,11 +830,15 @@ pub async fn diff(
 
         match outcome {
             Ok(published) => {
-                parent = use_range_mode.then(|| ParentPullRequest {
+                parent = Some(ParentPullRequest {
                     number: published.number,
                     branch: published.head.clone(),
                     head_oid: published.head_oid,
                 });
+                add_error(
+                    &mut result,
+                    record.published(index, prepared_commit, published.number),
+                );
                 published_links.push(published);
             }
             Err(error) => result = Err(error),
@@ -702,18 +848,11 @@ pub async fn diff(
     if result.is_ok() {
         add_error(
             &mut result,
-            register_native_stacks(&opts, gh, config, &published_links).await,
+            register_native_stacks(opts, gh, config, &published_links).await,
         );
     }
 
-    // This updates the commit message in the local Jujutsu repository (if it was
-    // changed by the implementation)
-    if !opts.dry_run {
-        add_error(
-            &mut result,
-            jj.rewrite_commit_messages(config, prepared_commits.as_mut_slice()),
-        );
-    }
+    add_error(&mut result, record.finish(prepared_commits));
 
     if opts.dry_run {
         let actions: Vec<_> = prepared_commits
@@ -731,8 +870,7 @@ pub async fn diff(
         )?;
 
         for (idx, pc) in &actions {
-            // With --title, this run has one Pull Request.
-            let title = opts.title.as_deref().unwrap_or_else(|| {
+            let title = overrides[*idx].title.as_deref().unwrap_or_else(|| {
                 pc.message
                     .get(&crate::message::MessageSection::Title)
                     .map(|t| &t[..])
@@ -952,7 +1090,7 @@ async fn lookup_parent_pull_request(
 /// The Pull Requests are already correct at this point, so problems with the
 /// stack itself are reported as warnings.
 async fn register_native_stacks(
-    opts: &DiffOptions,
+    opts: &PushOptions,
     gh: &crate::github::GitHub,
     config: &crate::config::Config,
     published: &[Published],
@@ -1078,10 +1216,11 @@ async fn register_native_stacks(
 }
 
 /// What a run changes in an existing Pull Request's title and body: the ones
-/// given with --title and --body, or with --update-message, the local
-/// description's.
+/// given in `overrides` (with --title and --body), or with --update-message,
+/// the local description's.
 fn title_and_body_updates(
-    opts: &DiffOptions,
+    opts: &PushOptions,
+    overrides: &Overrides,
     pull_request: &PullRequest,
     message: &crate::message::MessageSectionsMap,
 ) -> PullRequestUpdate {
@@ -1089,10 +1228,14 @@ fn title_and_body_updates(
     if opts.update_message {
         updates.update_message(pull_request, message);
     }
-    if let Some(title) = opts.title.as_ref().filter(|t| **t != pull_request.title) {
+    if let Some(title) = overrides
+        .title
+        .as_ref()
+        .filter(|t| **t != pull_request.title)
+    {
         updates.title = Some(title.clone());
     }
-    if let Some(body) = opts
+    if let Some(body) = overrides
         .body
         .as_ref()
         .filter(|b| pull_request.body.as_ref() != Some(b))
@@ -1104,13 +1247,15 @@ fn title_and_body_updates(
 
 #[allow(clippy::too_many_arguments)]
 async fn diff_impl(
-    opts: &DiffOptions,
+    opts: &PushOptions,
     message_on_prompt: &mut String,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
     local_commit: &mut crate::jj::PreparedCommit,
     resolved: Resolved,
+    overrides: &Overrides,
+    pushing_new: &mut dyn FnMut(&str) -> Result<()>,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
     taken_branches: &mut HashSet<String>,
@@ -1148,8 +1293,8 @@ async fn diff_impl(
     // need for the warning.
     if let Some(ref pull_request) = pull_request
         && !opts.update_message
-        && opts.title.is_none()
-        && opts.body.is_none()
+        && overrides.title.is_none()
+        && overrides.body.is_none()
     {
         let matches = |message: &crate::message::MessageSectionsMap| {
             let mut updates: PullRequestUpdate = Default::default();
@@ -1184,11 +1329,12 @@ async fn diff_impl(
         .get(&MessageSection::Title)
         .map(|t| &t[..])
         .unwrap_or("");
-    let pr_title = opts.title.as_deref().unwrap_or(title);
+    let pr_title = overrides.title.as_deref().unwrap_or(title);
 
-    let pull_request_branch = match &pull_request {
-        Some(pr) => pr.head.clone(),
-        None => {
+    let pull_request_branch = match (&pull_request, &overrides.branch) {
+        (Some(pr), _) => pr.head.clone(),
+        (None, Some(branch)) => config.new_github_branch(branch),
+        (None, None) => {
             let name = config.get_new_branch_name(taken_branches, pr_title);
             taken_branches.insert(name.clone());
             config.new_github_branch(&name)
@@ -1253,7 +1399,8 @@ async fn diff_impl(
             // Request branch and base are all the right ones.
             output("✅", "No update necessary")?;
 
-            let pull_request_updates = title_and_body_updates(opts, pull_request, message);
+            let pull_request_updates =
+                title_and_body_updates(opts, overrides, pull_request, message);
             if !pull_request_updates.is_empty() {
                 if opts.dry_run {
                     output(
@@ -1498,7 +1645,8 @@ async fn diff_impl(
             }
 
             // Things we want to update in the Pull Request on GitHub
-            let mut pull_request_updates = title_and_body_updates(opts, &pull_request, message);
+            let mut pull_request_updates =
+                title_and_body_updates(opts, overrides, &pull_request, message);
 
             // Push the new commit onto the Pull Request branch.
             run_command(&mut cmd)
@@ -1533,6 +1681,7 @@ async fn diff_impl(
 
             // Push the Pull Request branch. Its base, the parent's Pull
             // Request branch or master, is on GitHub already.
+            pushing_new(pull_request_branch.branch_name())?;
             run_command(&mut cmd)
                 .await
                 .reword("git push failed".to_string())?;
@@ -1541,7 +1690,8 @@ async fn diff_impl(
             let pull_request_number = gh
                 .create_pull_request(
                     pr_title,
-                    opts.body
+                    overrides
+                        .body
                         .clone()
                         .unwrap_or_else(|| build_github_body(message)),
                     base_branch.branch_name().to_string(),
@@ -1560,9 +1710,6 @@ async fn diff_impl(
                     pull_request_number, pull_request_url,
                 ),
             )?;
-
-            message.insert(MessageSection::PullRequest, pull_request_url);
-            local_commit.message_changed = true;
 
             let result = gh
                 .request_reviewers(pull_request_number, requested_reviewers)
