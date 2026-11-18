@@ -88,6 +88,11 @@ enum Commands {
     /// Update the local stack after Pull Requests merged: abandon the merged
     /// changes and rebase the rest onto the main branch
     Sync(commands::sync::SyncOptions),
+
+    /// Write a new stack file, or check one. A stack file lists a stack's
+    /// Pull Requests for `jj spr submit`.
+    #[clap(subcommand)]
+    StackFile(commands::stack_file::StackFileCommand),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +180,9 @@ pub async fn spr() -> Result<()> {
     if let Commands::Format(opts) = cli.command {
         return commands::format::format(opts, &jj, &config).await;
     }
+    if let Commands::StackFile(commands::stack_file::StackFileCommand::Init(opts)) = cli.command {
+        return commands::stack_file::init(opts, &jj);
+    }
 
     let github_auth_token = match cli.github_auth_token {
         Some(v) => v,
@@ -220,9 +228,14 @@ pub async fn spr() -> Result<()> {
         Commands::Cleanup(opts) => commands::cleanup::cleanup(opts, &jj, &gh, &config).await?,
         Commands::Sync(opts) => commands::sync::sync(opts, &jj, &mut gh, &config).await?,
         Commands::Stack(opts) => commands::stack::stack(opts, &jj, &gh, &config).await?,
+        Commands::StackFile(commands::stack_file::StackFileCommand::Status(opts)) => {
+            commands::stack_file::status(opts, &jj, &gh, &config).await?
+        }
         // The following commands are executed above and return from this
         // function before it reaches this match.
-        Commands::Init | Commands::Format(_) => (),
+        Commands::Init
+        | Commands::Format(_)
+        | Commands::StackFile(commands::stack_file::StackFileCommand::Init(_)) => (),
     };
 
     Ok::<_, Error>(())

@@ -160,6 +160,11 @@ impl TestEnv {
         outcome
     }
 
+    /// The environment variables every command runs with.
+    pub fn env_vars(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.env.iter().map(|(k, v)| (k, v))
+    }
+
     /// Run jj-spr and return its outcome whether or not it succeeded.
     pub fn try_spr(&self, args: &[&str]) -> Outcome {
         run_command(&self.work, &self.env, jj_spr_bin(), args)

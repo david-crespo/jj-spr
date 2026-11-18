@@ -14,5 +14,6 @@ pub mod jj;
 pub mod message;
 pub mod output;
 pub mod revision_utils;
+pub mod stack_file;
 pub mod stacks;
 pub mod utils;
