@@ -156,6 +156,12 @@ jj spr amend [OPTIONS]
 
 ---
 
+### Stack files
+
+`jj spr submit <file>`, `jj spr stack-file init <file> --tips <revset>`, and `jj spr stack-file status <file>` work with a stack file, as do `jj spr land <file>`, `jj spr sync <file>`, and `jj spr close <file>`. See [Stack Files](../user/stack-file.md).
+
+---
+
 ## Revision Syntax
 
 SPR supports Jujutsu's revision syntax:

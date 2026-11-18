@@ -24,6 +24,7 @@ If you're coming from Git, the key difference is that Jujutsu uses "changes" wit
 ### How To
 - [Create and Land a Simple PR](./user/simple.md)
 - [Stack Multiple PRs](./user/stack.md)
+- [Plan a Stack in a Stack File](./user/stack-file.md)
 - [Format and Update Commit Messages](./user/commit-message.md)
 - [When to Use What: Decision Guide](./user/when-to-use-what.md)
 

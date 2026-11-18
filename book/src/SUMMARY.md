@@ -8,6 +8,7 @@
 - [Setup](./user/setup.md)
 - [Single PR Workflow](./user/simple.md)
 - [Stacked PRs](./user/stack.md)
+- [Stack Files](./user/stack-file.md)
 - [Commit Messages](./user/commit-message.md)
 
 # Reference
