@@ -78,7 +78,7 @@ The codebase follows a library + binary structure:
 - **`spr/src/jj.rs`**: Jujutsu integration layer (executes `jj` commands, manages change IDs)
 - **`spr/src/git.rs`**: Git operations via `git2` crate (branch management, commit creation)
 - **`spr/src/github.rs`**: GitHub API client (PR creation/updates, GraphQL queries)
-- **`spr/src/config.rs`**: Configuration management (reads from git config)
+- **`spr/src/config.rs`**: Configuration management (reads jj config, then git config as a fallback)
 - **`spr/src/message.rs`**: Commit message parsing and formatting (Summary, Reviewers, etc.)
 - **`spr/src/revision_utils.rs`**: Revision parsing and resolution
 - **`spr/src/output.rs`**: Terminal output formatting
@@ -86,9 +86,9 @@ The codebase follows a library + binary structure:
 
 ### Key Design Patterns
 
-1. **Change-based workflow**: Each Jujutsu change (identified by a change ID) maps to one GitHub PR. The PR branch name includes the change ID to maintain the link even after rebases.
+1. **Change-based workflow**: Each Jujutsu change (identified by a change ID) maps to one GitHub PR, or several adjacent changes share one with `--one-pr`. A `Pull Request:` line in the change description keeps the link through rebases. The PR branch name is the branch prefix plus a slug of the PR title.
 
-2. **Stacked PR handling**: When creating stacked PRs, the tool creates intermediate branches for each change in the stack. The base branch of PR #2 points to the PR branch of PR #1, allowing independent reviews and landing.
+2. **Stacked PR handling**: Each PR targets the PR branch of the change below it: the base branch of PR #2 is the PR branch of PR #1. When the repository has stacked pull requests enabled, the chain is registered as a GitHub stack.
 
 3. **Commit message structure**: Commit messages are parsed into sections (Summary, Reviewers, etc.) which are stored in both the local Jujutsu change and the GitHub PR. The tool maintains bidirectional sync.
 
@@ -100,7 +100,7 @@ The codebase follows a library + binary structure:
 - **GitHub-only**: Only works with GitHub (not GitLab, Bitbucket, etc.)
 - **Stable change IDs**: Relies on Jujutsu's change IDs remaining stable across rebases
 - **Async runtime**: Uses Tokio for async operations (GitHub API calls)
-- **Configuration via git config**: Settings are stored in `.git/config` using `spr.*` keys
+- **Configuration via jj config**: `jj spr init` stores `spr.*` keys with `jj config set --repo`. Values are read from jj config first, then git config
 
 ## Dependencies
 
@@ -123,14 +123,14 @@ The codebase follows a library + binary structure:
 1. User runs `jj spr diff -r <revision>`
 2. Tool resolves revision to change ID and Git commit hash
 3. Parses commit message into sections
-4. Creates/updates Git branch named with change ID
+4. Creates/updates Git branch named from the branch prefix and PR title
 5. Pushes branch to GitHub
 6. Creates/updates PR via GitHub API
 7. Updates local commit message with PR number
 
 ### Landing PRs
 1. User runs `jj spr land -r <revision>`
-2. Tool finds associated PR by change ID
+2. Tool reads the PR number from the change's `Pull Request:` line
 3. Verifies PR is approved (if configured)
 4. Squash-merges PR on GitHub
 5. Cleans up remote branch
@@ -139,7 +139,7 @@ The codebase follows a library + binary structure:
 1. User creates multiple changes with parent-child relationships
 2. Runs `jj spr diff --all` or `jj spr diff -r main..@`
 3. Tool creates PRs in order, each with base pointing to previous PR's branch
-4. When landing, only the bottom PR is merged; others remain valid
+4. Landing a PR in a GitHub stack also merges every PR below it; `jj spr sync` then abandons the landed changes and rebases the rest
 
 ## Testing Strategy
 
@@ -150,9 +150,9 @@ The codebase follows a library + binary structure:
 
 ## Configuration Options
 
-Stored in git config under `spr.*` namespace:
+Stored in jj config (`jj config set --repo`, written by `jj spr init`) under the `spr.*` namespace, with git config as a fallback:
 - `spr.githubRepository` - Owner/repo name
-- `spr.branchPrefix` - Prefix for generated branches (default: `spr/`)
+- `spr.branchPrefix` - Prefix for generated branches (required; `jj spr init` suggests `spr/<GitHub username>/`)
 - `spr.requireApproval` - Require PR approval before landing
-- `spr.githubHost` - Custom GitHub Enterprise host
-- `spr.githubToken` - GitHub API token (typically stored via `jj spr init`)
+- `spr.githubApiUrl` - GitHub REST API base URL, for GitHub Enterprise (default: `https://api.github.com`)
+- `spr.githubAuthToken` - GitHub API token (typically stored via `jj spr init`; without it, the GitHub CLI's token is used)

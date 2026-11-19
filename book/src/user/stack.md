@@ -16,7 +16,7 @@ When working with multiple PRs, you have two main approaches:
 
 2. **Dependent stacks** (for true dependencies)
    - Changes must be landed in order (parent → child)
-   - More complex workflow with manual rebasing
+   - More complex workflow
    - Only use when second change literally won't work without first
    - Example: Add database table → Add API endpoints using that table
 
@@ -62,10 +62,9 @@ jj spr land --cherry-pick -r <change-id>
 jj spr land --cherry-pick -r <other-change-id>
 ```
 
-**After landing, you still need to rebase:**
+**After landing, bring your local changes up to date:**
 ```shell
-jj git fetch
-jj rebase -r @ -d main@origin
+jj spr sync
 ```
 
 **Benefits:**
@@ -113,6 +112,64 @@ This is for when the second change literally won't work without the first.
 
    This is equivalent to calling `jj spr diff` on each change in your stack from `@-` back to `main@origin`.
 
+## GitHub Stacks
+
+A dependent PR targets the PR branch of the change below it. When the
+repository has stacked pull requests enabled, jj-spr registers the chain as a
+GitHub
+[stack](https://docs.github.com/en/pull-requests/how-tos/stacked-pull-requests),
+which GitHub shows as one unit in its UI.
+
+- Updates add commits to the PR branch (with your `-m` message) and never
+  rewrite it. An update merges in the parent PR's current head, so GitHub
+  keeps showing only the change itself, and keeps the change in ordinary
+  commits, which GitHub replays when it rebases the stack after a merge. After
+  a reorder, a PR that moved up gets its whole change in a new commit.
+- After publishing, `jj spr diff` registers the chain as a GitHub stack, or
+  appends new PRs to the existing one. GitHub does not allow changing the base
+  of a stacked PR, so when you reorder, insert, or remove changes, `jj spr diff
+  --all` dissolves the stack first and rebuilds it. It refuses to do that if
+  the stack contains PRs the run would not update; run it from the top of the
+  stack instead.
+- Without `--all`, a change stacks on its parent's existing PR, so the parent
+  must have been submitted already.
+- `jj spr land` merges through GitHub's stack-aware merge. Landing the bottom
+  PR merges just that one; landing a PR higher up merges it together with
+  every PR below it, after listing them and asking (pass `--yes` to skip the
+  question, which is required outside a terminal). Every PR that would merge
+  is checked first: none may be a draft, and each must be approved if
+  `spr.requireApproval` is set. How `land` merges depends on the repository's
+  default commit message for squash merges:
+  - When the default is the pull request title and description (`PR_TITLE`
+    and `PR_BODY` in GitHub's API), `land` makes one merge of the highest PR
+    being landed. GitHub merges any PRs below it in the same operation, with
+    no rebase in between. Each commit on the main branch has its PR's title,
+    followed by its number, and its description.
+  - With any other default, or if jj-spr can't read it, `land` merges the PRs
+    one at a time, bottom first, so each commit gets jj-spr's title and
+    message. After each merge, GitHub retargets the next PR to the main branch
+    and rebases the rest of the stack. `land` waits for that rebase before it
+    merges the next PR. When it merges more than one PR this way, `land`
+    prints a hint about changing the default.
+
+  Afterwards, run `jj spr sync` and then `jj spr diff --all`. `land` does not
+  wait for CI. If GitHub blocks a PR for required checks or reviews, `land`
+  stops there and prints which PRs landed. Run `jj spr sync`, then run
+  `jj spr land` again once GitHub allows the merge.
+- If stacked pull requests are not enabled for the repository, the PRs still
+  target each other; they just aren't registered as a GitHub stack.
+
+**Upgrading from an older jj-spr:** Older versions created a base branch of
+its own (`<prefix>main.<title>`) for each dependent PR unless `spr.nativeStacks`
+was set. The `--native-stack` and `--no-native-stack` flags are removed, and
+`spr.nativeStacks` is ignored if still set. The next `jj spr diff` retargets a
+PR on such a base branch to its parent's PR branch or to the main branch.
+Until then, `jj spr land` refuses to land it. Once no open PR uses the old base
+branches, `jj spr cleanup --confirm` deletes them from GitHub.
+
+Limitations: repositories that merge through a merge queue are not supported
+yet.
+
 ## Understanding Your Stack
 
 Use `jj log` to visualize your stack:
@@ -149,27 +206,19 @@ Local Jujutsu State:                 GitHub State:
 @  qpvuntsm (empty)
 │
 ○  kmkuslkw                     →    PR #124: "Add user profile endpoints"
-│  Add user profile endpoints        base: jj-spr-rlvkpnrw (PR #123's branch)
-│                                    branch: jj-spr-kmkuslkw
+│  Add user profile endpoints        base: spr/alice/add-authentication-module (PR #123's branch)
+│                                    branch: spr/alice/add-user-profile-endpoints
 ○  rlvkpnrw                     →    PR #123: "Add authentication module"
 │  Add authentication module         base: main
-│                                    branch: jj-spr-rlvkpnrw
+│                                    branch: spr/alice/add-authentication-module
 ◆  main@origin
 ```
 
 **Key points:**
 - Each change has a unique ID (`rlvkpnrw`, `kmkuslkw`)
-- jj-spr creates GitHub branches automatically (`jj-spr-{change-id}`)
+- jj-spr creates GitHub branches automatically, named with the branch prefix and the PR's title (`spr/alice/add-user-profile-endpoints`)
 - Stacked PRs: PR #124 is based on PR #123's branch
 - When PR #123 lands, PR #124 automatically updates to be based on `main`
-
-**Upgrading from an older jj-spr:** Older versions created a base branch of
-its own (`<prefix>main.<title>`) for each dependent PR unless `spr.nativeStacks`
-was set. The `--native-stack` and `--no-native-stack` flags are removed, and
-`spr.nativeStacks` is ignored if still set. The next `jj spr diff` retargets a
-PR on such a base branch to its parent's PR branch or to the main branch.
-Until then, `jj spr land` refuses to land it. Once no open PR uses the old base
-branches, `jj spr cleanup --confirm` deletes them from GitHub.
 
 ## Updating Changes in the Stack
 
@@ -229,7 +278,7 @@ Alternatively, edit the change directly:
 
 4. Return to your empty working copy:
    ```shell
-   jj new qpvuntsm  # Creates new working copy on top of qpvuntsm
+   jj new kmkuslkw  # Creates new working copy on top of the stack
    ```
 
 **Which method to use?**
@@ -240,9 +289,9 @@ Alternatively, edit the change directly:
 
 > 🚨 **CRITICAL WARNINGS FOR STACKED LANDING:**
 >
-> 1. **Landing order matters:** Always land changes in order (parent before child). Landing out of order **will** cause merge conflicts and break your stack.
+> 1. **Landing order matters:** Changes land in order (parent before child). In a GitHub stack, landing a child also merges every PR below it, after asking. Outside a GitHub stack, `jj spr land` refuses to land a PR while the PR below it is open.
 >
-> 2. **Manual rebasing required:** After **every** `jj spr land`, you must manually rebase both your working copy AND any remaining changes in the stack. This is error-prone and easy to forget.
+> 2. **Sync after landing:** After `jj spr land` (or a merge on GitHub), run `jj spr sync` to abandon the landed change and rebase the rest of the stack. See [Syncing after merges](#syncing-after-merges).
 
 ### Landing Process (Parent Change)
 
@@ -262,24 +311,14 @@ Before landing:
    jj spr land -r rlvkpnrw  # Use the actual change ID
    ```
 
-2. **REQUIRED - Fetch and rebase working copy:**
+2. **Sync the local stack:**
    ```shell
-   jj git fetch
-   jj rebase -r @ -d main@origin
+   jj spr sync  # abandons rlvkpnrw and rebases kmkuslkw onto main@origin
    ```
 
-3. **REQUIRED - Rebase child changes onto new main:**
+3. **Update remaining PRs:**
    ```shell
-   # Check what needs rebasing
-   jj log -r 'main@origin..'
-
-   # Rebase the child change
-   jj rebase -s kmkuslkw -d main@origin  # kmkuslkw is now based on main
-   ```
-
-4. **REQUIRED - Update remaining PRs:**
-   ```shell
-   jj spr diff --all  # Updates PR #124 to be based on main instead of PR #123
+   jj spr diff --all  # Updates PR #124 from the rebased change
    ```
 
 **After landing:**
@@ -288,14 +327,127 @@ Before landing:
 ◆  main@origin (now includes rlvkpnrw)
 ```
 
-**This is 4 commands just to land ONE change.** If you skip any step, your stack will be broken.
+### Checking a stack
+
+`jj spr stack` shows the local stack (top first, like `jj log`) next to each
+change's Pull Request: its state, CI checks, review and base branch, and the
+GitHub stack they belong to:
+
+```
+  🧱  GitHub stack #1: #1, #2, #3 (bottom first)
+○  ryxopsnk  Change C  #3  open, needs update  CI ✗  changes requested, 1 thread  → spr/change-b
+○  nrlzpwsu  Change B  #2  open                CI ●  no review                    → spr/change-a
+○  xrrqyttw  Change A  #1  open                CI ✓  approved                     → main
+◆  main@origin
+
+  ⚠️  The local change for #3 differs from the Pull Request. Run `jj
+      spr diff --all` to update it.
+  ⚠️  #3 has failing checks: build.
+  ⚠️  #3 has changes requested.
+  ⚠️  #3 has 1 unresolved review thread.
+  🛬  #1 is ready to land: `jj spr land -r xrrqyttw`
+```
+
+`CI ✓` means every check passed, `✗` that one failed, `●` that some are still
+running, and `-` that there are none. Checks belong to a Pull Request's
+current head, so they reset when you push.
+
+It points out anything that does not match, with the command that fixes it:
+changes without a Pull Request, local changes that differ from their Pull
+Request, drafts, failing checks, requested changes, unresolved review threads,
+merged or closed Pull Requests, Pull Requests that target the wrong branch,
+and ones missing from the GitHub stack. The last line
+names the Pull Requests, from the bottom of the stack up, that are ready to
+land: up to date, not drafts, checks passed, no unresolved threads, and
+approved (if `spr.requireApproval` is set, or the repository requires
+reviews). In a GitHub stack, landing the top one of those lands them all.
+
+`-v` replaces the CI and review columns with lines under each Pull Request:
+its checks by name, who approved or requested changes, who has yet to review,
+and the unresolved threads:
+
+```
+○  ryxopsnk  Change C  #3  open  → spr/change-b
+│    checks   ✗ build   ✓ clippy
+│    review   changes requested by @bob
+│    threads  ▸ src/c.rs:12  @bob  "Please rename this"
+```
+
+`--json` prints the same information for scripts, bottom first: the changes
+with their Pull Requests, the GitHub stacks, the findings (each with a stable
+`kind`, such as `failing_checks` or `needs_update`), and `ready_to_land`.
+
+It only reads from GitHub and the repository, and changes nothing. Use `-r` to
+pick another stack.
+
+### Syncing after merges
+
+`jj spr sync` brings a local stack up to date after some of its Pull Requests
+merged, whether with `jj spr land` or on GitHub:
+
+1. It fetches, and looks up the Pull Request of every change between
+   `main@origin` and `@-` (or the revision given with `-r`).
+2. It abandons the changes whose Pull Requests merged. jj moves anything above
+   an abandoned change onto its parent, so this also works when a PR in the
+   middle merged first (for example a cherry-picked one).
+3. It rebases the rest of the stack onto `main@origin`.
+
+It stops before changing anything if a merged change has local edits that were
+not in the merged Pull Request, so unpublished work is never abandoned. It
+never rebases just because `main` moved (use `jj rebase` for that), and it
+reports conflicts left by the rebase instead of submitting them. `--dry-run`
+shows what it would do, and `jj undo` reverts a sync.
+
+Afterwards, run `jj spr diff --all` to update the remaining Pull Requests.
+
+### Working on someone else's stack
+
+`jj spr patch <number>` creates local changes from existing Pull Requests.
+If the Pull Request is part of a native GitHub stack, it fetches every open
+Pull Request in the stack, bottom first, whichever one you name:
+
+```
+$ jj spr patch 2
+  🔄  Fetching from origin
+  🧱  #2 is part of a stack: #1, #2, #3 (bottom first)
+  📥  #1: created yuynpkkv Change A
+  📥  #2: created pkmlqutt Change B
+  📥  #3: created yxpnkqnw Change C
+  👉  Working copy is now on top of yxpnkqnw
+```
+
+Each change holds its Pull Request's own diff and a `Pull Request:` trailer,
+so `jj spr diff --all` updates those Pull Requests instead of opening new
+ones. `--no-stack` fetches only the named Pull Request, and `--no-checkout`
+leaves the working copy where it is.
+
+When someone pushes to one of the Pull Requests, run `jj spr patch` again to
+update your changes. Each Pull Request that already has a local change is
+compared with it:
+
+- **up to date:** nothing to do
+- **updated from GitHub:** GitHub has commits the change lacks, and the
+  change has nothing that is not on GitHub
+- **kept:** the change has local edits that are not on GitHub yet, and GitHub
+  has nothing new; `jj spr diff` pushes them
+
+If a change and its Pull Request both have edits the other lacks, it changes
+nothing and says which. Move your edits into a separate change (for example
+with `jj split`) and run it again.
+
+`jj spr diff` never pushes over someone else's commits either. If a Pull
+Request has commits its local change lacks, it stops before pushing anything
+and suggests `jj spr patch`. Your own edits since your last push don't count,
+and neither does GitHub rebasing a stack after a merge. To replace what is on
+GitHub with your version anyway, pass `--discard-remote-changes`. The other
+person's commits stay in the branch's history, but their edits disappear
+from the Pull Request's diff.
 
 ### Best Practices
 
 - ✅ **Always land in order:** Parent → Child → Grandchild
 - ✅ **Double-check change IDs** before landing (use `jj log`)
 - ✅ **If changes aren't truly dependent, use `--cherry-pick` instead** (see above)
-- ❌ **Never land out of order** unless you're prepared to manually fix merge conflicts
 
 ## Rebasing the Whole Stack
 
@@ -387,11 +539,11 @@ Jujutsu's revset language makes it easy to work with stacks:
 # Show all your changes not yet in main
 jj log -r 'mine() & ~main@origin'
 
-# Create PRs for all your ready changes
-jj spr diff --all -r 'ready() & ~main@origin'
+# Create or update PRs for every change from main up to @-
+jj spr diff -r 'main@origin..@-'
 
 # Show changes that have PRs
-jj log -r 'description(regex:"#[0-9]+")'
+jj log -r 'description(substring:"Pull Request:")'
 ```
 
 ## Tips for Stack Management

@@ -130,9 +130,9 @@ The individual commits that you see in the PR are solely for the benefit of revi
 
 ## Updating before landing
 
-Unlike Git, Jujutsu automatically maintains your change's identity even when rebasing. However, you must still run `jj spr diff` to update the PR before landing if you've rebased onto new upstream changes, or else `jj spr land` will fail.
+`jj spr land` merges the PR as it is on GitHub. It does not compare the PR with your local change. If you've edited the change since your last `jj spr diff`, run `jj spr diff` before landing, or those edits won't land. If you land without updating, `jj spr sync` won't abandon the local change, because it has edits that are not in the merged PR.
 
-This is because `jj spr land` checks to make sure that the PR content matches what will be landed.
+A rebase alone doesn't need an update: landing works as long as the PR has no conflicts with upstream `main`.
 
 ## Conflicts on landing
 
@@ -141,7 +141,7 @@ This is because `jj spr land` checks to make sure that the PR content matches wh
 1. Fetch and rebase your change onto latest upstream `main`:
    ```shell
    jj git fetch
-   jj rebase -r @ -d main@origin
+   jj rebase -s @- -d main@origin
    ```
 
 2. Resolve any conflicts:
@@ -158,7 +158,7 @@ This is because `jj spr land` checks to make sure that the PR content matches wh
 
 4. Run `jj spr land` again:
    ```shell
-   jj spr land
+   jj spr land -r @-
    ```
 
 Note that even if your change is not based on the latest upstream `main`, landing will still succeed as long as there are no conflicts with the actual latest upstream `main`.
@@ -208,9 +208,8 @@ jj spr diff  # Update the PR
 # 6. After approval, land it
 jj spr land -r @-
 
-# 7. Rebase your working copy
-jj git fetch
-jj rebase -r @ -d main@origin
+# 7. Sync your local state
+jj spr sync
 ```
 
 ## Troubleshooting
@@ -277,7 +276,7 @@ jj spr land -r @-
 1. Fetch and rebase onto latest main:
    ```shell
    jj git fetch
-   jj rebase -r @- -d main@origin
+   jj rebase -s @- -d main@origin
    ```
 
 2. Resolve any conflicts (Jujutsu will mark them in files):
@@ -295,16 +294,6 @@ jj spr land -r @-
    ```shell
    jj spr land -r @-
    ```
-
-### "The PR content doesn't match what will be landed"
-
-**Cause:** You've made local changes (like rebasing) without updating the PR.
-
-**Solution:**
-```shell
-jj spr diff  # Update the PR to match local state
-jj spr land -r @-  # Now landing will work
-```
 
 ### "I can't find my change ID"
 

@@ -100,23 +100,15 @@ In this example:
 
    > **Note:** By default, `land` operates on `@` (your working copy). Since your PR change is at `@-`, you must specify `-r @-`.
 
-8. **🚨 CRITICAL: After landing, you MUST manually rebase your working copy:**
+8. **After landing, sync your local state:**
    ```shell
-   jj git fetch
-   jj rebase -r @ -d main@origin
+   jj spr sync
    ```
 
-   > ⚠️ **IMPORTANT - DO NOT SKIP THIS STEP:** jj-spr currently requires manual rebasing after **every** `jj spr land`. The `land` command merges your PR on GitHub but does **not** automatically update your local Jujutsu state.
-   >
-   > **What happens if you skip this:**
-   > - Your working copy will still be based on old `main`
-   > - Future changes will be based on outdated code
-   > - You'll face conflicts and confusion later
-   > - Your stack will be out of sync with GitHub
-   >
-   > **This is a known limitation** that may be automated in future versions. For now, always run the rebase commands immediately after landing.
-   >
-   > **Pro tip:** Create a shell alias (see [Troubleshooting](#troubleshooting)) to combine landing and rebasing into one command.
+   > `land` merges your PR on GitHub but does not change your local
+   > repository. `jj spr sync` fetches, abandons the landed change, and rebases
+   > anything left (including your working copy) onto `main@origin`. It refuses
+   > to abandon a change that has local edits which were not in the merged PR.
 
 ## Working with Change IDs
 
@@ -138,9 +130,9 @@ The individual commits that you see in the PR are solely for the benefit of revi
 
 ## Updating before landing
 
-Unlike Git, Jujutsu automatically maintains your change's identity even when rebasing. However, you must still run `jj spr diff` to update the PR before landing if you've rebased onto new upstream changes, or else `jj spr land` will fail.
+`jj spr land` merges the PR as it is on GitHub. It does not compare the PR with your local change. If you've edited the change since your last `jj spr diff`, run `jj spr diff` before landing, or those edits won't land. If you land without updating, `jj spr sync` won't abandon the local change, because it has edits that are not in the merged PR.
 
-This is because `jj spr land` checks to make sure that the PR content matches what will be landed.
+A rebase alone doesn't need an update: landing works as long as the PR has no conflicts with upstream `main`.
 
 ## Conflicts on landing
 
@@ -149,7 +141,7 @@ This is because `jj spr land` checks to make sure that the PR content matches wh
 1. Fetch and rebase your change onto latest upstream `main`:
    ```shell
    jj git fetch
-   jj rebase -r @ -d main@origin
+   jj rebase -s @- -d main@origin
    ```
 
 2. Resolve any conflicts:
@@ -166,7 +158,7 @@ This is because `jj spr land` checks to make sure that the PR content matches wh
 
 4. Run `jj spr land` again:
    ```shell
-   jj spr land
+   jj spr land -r @-
    ```
 
 Note that even if your change is not based on the latest upstream `main`, landing will still succeed as long as there are no conflicts with the actual latest upstream `main`.
@@ -216,9 +208,8 @@ jj spr diff  # Update the PR
 # 6. After approval, land it
 jj spr land -r @-
 
-# 7. Rebase your working copy
-jj git fetch
-jj rebase -r @ -d main@origin
+# 7. Sync your local state
+jj spr sync
 ```
 
 ## Troubleshooting
@@ -246,9 +237,16 @@ jj rebase -r @ -d main@origin
 
 ### "I forgot to rebase after landing"
 
-**Problem:** After `jj spr land`, you must manually rebase your working copy onto the updated `main@origin`.
+**Problem:** After `jj spr land`, your working copy is still based on the old `main`.
 
 **Solution:**
+```shell
+jj spr sync
+```
+
+If `sync` refuses because a landed change has local edits, move the edits you
+want to keep into another change (for example with `jj split`), or abandon the
+change, and run it again. To rebase by hand instead:
 ```shell
 jj git fetch
 jj rebase -r @ -d main@origin
@@ -278,7 +276,7 @@ jj spr land -r @-
 1. Fetch and rebase onto latest main:
    ```shell
    jj git fetch
-   jj rebase -r @- -d main@origin
+   jj rebase -s @- -d main@origin
    ```
 
 2. Resolve any conflicts (Jujutsu will mark them in files):
@@ -296,16 +294,6 @@ jj spr land -r @-
    ```shell
    jj spr land -r @-
    ```
-
-### "The PR content doesn't match what will be landed"
-
-**Cause:** You've made local changes (like rebasing) without updating the PR.
-
-**Solution:**
-```shell
-jj spr diff  # Update the PR to match local state
-jj spr land -r @-  # Now landing will work
-```
 
 ### "I can't find my change ID"
 

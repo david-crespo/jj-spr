@@ -172,17 +172,17 @@ See the [stacking documentation](./docs/user/stack.md) for detailed workflows.
 
 ## Configuration
 
-SPR stores configuration in your repository's git config:
+SPR stores configuration in your repository's Jujutsu config:
 
 ```bash
 # Set GitHub repository (if not auto-detected)
-git config spr.githubRepository "owner/repo"
+jj config set --repo spr.githubRepository "owner/repo"
 
 # Set branch prefix for generated branches
-git config spr.branchPrefix "yourname/spr/"
+jj config set --repo spr.branchPrefix "spr/yourname/"
 
 # Require approval before landing
-git config spr.requireApproval true
+jj config set --repo spr.requireApproval true
 ```
 
 ## Requirements
