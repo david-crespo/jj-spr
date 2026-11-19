@@ -175,6 +175,11 @@ fn diff_range_not_starting_on_main_stacks_on_the_parents_pr() {
     let pb = env.pr_for(&b);
     assert_eq!(env.pr(pb).base_ref, env.pr(pa).head_ref);
     assert_eq!(env.pr_files(pb), vec!["b.txt"]);
+    assert_eq!(
+        env.active_stacks(),
+        vec![vec![pa, pb]],
+        "the second run makes the two a stack"
+    );
 }
 
 #[test]

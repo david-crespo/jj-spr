@@ -7,34 +7,15 @@ mod common;
 
 use common::env::TestEnv;
 
-fn description(env: &TestEnv, change: &str) -> String {
-    env.jj_query(&["log", "--no-graph", "-r", change, "-T", "description"])
-}
-
 /// A change's description without its `Pull Request:` line.
 fn description_without_link(env: &TestEnv, change: &str) -> String {
-    description(env, change)
+    env.description(change)
         .lines()
         .filter(|line| !line.starts_with("Pull Request:"))
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_string()
-}
-
-/// The subjects of the commits on a Pull Request's branch that are not on
-/// its base branch, oldest first.
-fn pr_commits(env: &TestEnv, number: u64) -> Vec<String> {
-    let pr = env.pr(number);
-    env.remote_git(&[
-        "log",
-        "--reverse",
-        "--format=%s",
-        &format!("{}..{}", pr.base_ref, pr.head_ref),
-    ])
-    .lines()
-    .map(str::to_string)
-    .collect()
 }
 
 const TITLE: &str = "Extract the HTTP app";
@@ -100,7 +81,7 @@ fn one_pr_takes_the_given_title_and_body_and_keeps_each_step() {
     assert_eq!(pr.title, TITLE);
     assert_eq!(pr.body, BODY);
     assert_eq!(
-        pr_commits(&env, number),
+        env.pr_commits(number),
         vec!["Change b1", "Change b2", "Change b3"]
     );
     for (change, name) in b.iter().zip(["b1", "b2", "b3"]) {
@@ -171,8 +152,8 @@ fn a_run_with_several_pull_requests_is_refused() {
         vec!["main"],
         "nothing may be pushed"
     );
-    assert_eq!(description(&env, &a).trim(), "Change A");
-    assert_eq!(description(&env, &b).trim(), "Change B");
+    assert_eq!(env.description(&a).trim(), "Change A");
+    assert_eq!(env.description(&b).trim(), "Change B");
 
     let tips = format!("{a} | {b}");
     let out = env.try_spr(&["diff", "--tips", &tips, "--body", BODY]);
@@ -225,5 +206,5 @@ fn dry_run_shows_the_given_title() {
         out.text
     );
     assert!(env.gh.state().prs.is_empty());
-    assert_eq!(description(&env, &a).trim(), "Change A");
+    assert_eq!(env.description(&a).trim(), "Change A");
 }

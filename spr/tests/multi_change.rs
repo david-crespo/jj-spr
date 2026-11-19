@@ -35,10 +35,6 @@ fn stack_with_split_middle(env: &TestEnv) -> (Vec<String>, Vec<u64>) {
     (vec![a, lower, upper, c], prs)
 }
 
-fn description(env: &TestEnv, change: &str) -> String {
-    env.jj_query(&["log", "--no-graph", "-r", change, "-T", "description"])
-}
-
 #[test]
 fn squashed_halves_keep_their_pull_request() {
     // `jj squash` of two changes with the same `Pull Request:` line keeps
@@ -55,7 +51,7 @@ fn squashed_halves_keep_their_pull_request() {
         &changes[1],
     ]);
     assert_eq!(
-        description(&env, &changes[1])
+        env.description(&changes[1])
             .matches("Pull Request:")
             .count(),
         2
@@ -68,51 +64,15 @@ fn squashed_halves_keep_their_pull_request() {
     assert_eq!(env.pr_for(&changes[1]), prs[1]);
 }
 
-fn local_tree(env: &TestEnv, change: &str) -> String {
-    env.tree_of(change)
-}
-
-fn pr_tree(env: &TestEnv, number: u64) -> String {
-    env.remote_git(&["rev-parse", &format!("{}^{{tree}}", env.head_of(number))])
-}
-
-/// The subjects of the commits on a Pull Request's branch that are not on
-/// its base branch, oldest first.
-fn pr_commits(env: &TestEnv, number: u64) -> Vec<String> {
-    let pr = env.pr(number);
-    env.remote_git(&[
-        "log",
-        "--reverse",
-        "--format=%s",
-        &format!("{}..{}", pr.base_ref, pr.head_ref),
-    ])
-    .lines()
-    .map(str::to_string)
-    .collect()
-}
-
 /// A change on top of `below` that links `below`'s Pull Request.
 fn commit_into_pull_request(env: &TestEnv, below: &str, title: &str, path: &str) -> String {
-    let link = description(env, below)
+    let link = env
+        .description(below)
         .lines()
         .find(|line| line.starts_with("Pull Request:"))
         .expect("a Pull Request line")
         .to_string();
     env.commit(&format!("{title}\n\n{link}"), path, &format!("{path}\n"))
-}
-
-/// A Pull Request is open, targets `base`, shows `files`, and has the tree
-/// of `top`, its top change.
-fn check_pr(env: &TestEnv, number: u64, base: &str, files: &[&str], top: &str) {
-    let pr = env.pr(number);
-    assert!(pr.is_open(), "PR #{number} is {}", pr.state);
-    assert_eq!(pr.base_ref, base, "PR #{number}'s base");
-    assert_eq!(env.pr_files(number), files, "files in PR #{number}'s diff");
-    assert_eq!(
-        pr_tree(env, number),
-        local_tree(env, top),
-        "PR #{number}'s tree"
-    );
 }
 
 #[test]
@@ -157,7 +117,8 @@ fn either_half_alone_is_the_whole_pull_request() {
     assert_eq!(heads(&env, &prs), before, "nothing should be pushed");
 }
 
-fn amend_lower_half() {
+#[test]
+fn amending_the_lower_half_appends_one_commit() {
     let env = TestEnv::new();
     let (changes, prs) = stack_with_split_middle(&env);
     let old = env.head_of(prs[1]);
@@ -182,13 +143,8 @@ fn amend_lower_half() {
         "review feedback"
     );
     assert_eq!(env.pr_files(prs[1]), vec!["b.txt", "b2.txt"]);
-    assert_eq!(pr_tree(&env, prs[1]), local_tree(&env, &changes[2]));
+    assert_eq!(env.tree_of_pr(prs[1]), env.tree_of(&changes[2]));
     assert_eq!(env.pr_files(prs[2]), vec!["c.txt"]);
-}
-
-#[test]
-fn amending_the_lower_half_appends_one_commit() {
-    amend_lower_half();
 }
 
 #[test]
@@ -208,20 +164,13 @@ fn a_change_between_two_members_joins_them() {
         "the new change joins #{}",
         prs[1]
     );
-    check_pr(
-        &env,
+    env.check_pr(
         prs[1],
         &env.pr(prs[0]).head_ref,
         &["b.txt", "b2.txt", "b3.txt"],
         &changes[2],
     );
-    check_pr(
-        &env,
-        prs[2],
-        &env.pr(prs[1]).head_ref,
-        &["c.txt"],
-        &changes[3],
-    );
+    env.check_pr(prs[2], &env.pr(prs[1]).head_ref, &["c.txt"], &changes[3]);
 }
 
 #[test]
@@ -236,8 +185,8 @@ fn a_new_change_above_the_top_member_gets_its_own_pull_request() {
     env.spr(&["diff", "--all", "-m", "add d"]);
     let new = env.pr_for(&above);
     assert!(!prs.contains(&new));
-    check_pr(&env, new, &env.pr(prs[1]).head_ref, &["d.txt"], &above);
-    check_pr(&env, prs[2], &env.pr(new).head_ref, &["c.txt"], &changes[3]);
+    env.check_pr(new, &env.pr(prs[1]).head_ref, &["d.txt"], &above);
+    env.check_pr(prs[2], &env.pr(new).head_ref, &["c.txt"], &changes[3]);
 }
 
 #[test]
@@ -278,8 +227,7 @@ fn range_above_another_pull_request_stacks_the_run_on_it() {
         "-m",
         "range",
     ]);
-    check_pr(
-        &env,
+    env.check_pr(
         prs[1],
         &env.pr(prs[0]).head_ref,
         &["b.txt", "b2.txt"],
@@ -357,7 +305,7 @@ fn sync_abandons_every_member_of_a_merged_pull_request() {
     }
     assert_eq!(env.parent_of(&changes[3]), env.commit_id("main@origin"));
     env.spr(&["diff", "--all", "-m", "after sync"]);
-    check_pr(&env, prs[2], "main", &["c.txt"], &changes[3]);
+    env.check_pr(prs[2], "main", &["c.txt"], &changes[3]);
 }
 
 #[test]
@@ -370,14 +318,8 @@ fn sync_rebases_a_remaining_run_from_its_bottom_member() {
     assert!(!env.is_visible(&changes[0]));
     assert_eq!(env.parent_of(&changes[1]), env.commit_id("main@origin"));
     env.spr(&["diff", "--all", "-m", "after sync"]);
-    check_pr(&env, prs[1], "main", &["b.txt", "b2.txt"], &changes[2]);
-    check_pr(
-        &env,
-        prs[2],
-        &env.pr(prs[1]).head_ref,
-        &["c.txt"],
-        &changes[3],
-    );
+    env.check_pr(prs[1], "main", &["b.txt", "b2.txt"], &changes[2]);
+    env.check_pr(prs[2], &env.pr(prs[1]).head_ref, &["c.txt"], &changes[3]);
 }
 
 #[test]
@@ -393,7 +335,7 @@ fn diff_allows_github_rebase_of_a_run_after_stacked_merge() {
     env.jj(&["new", &changes[3]]);
 
     env.spr(&["diff", "--all", "-m", "after sync"]);
-    check_pr(&env, prs[1], "main", &["b.txt", "b2.txt"], &changes[2]);
+    env.check_pr(prs[1], "main", &["b.txt", "b2.txt"], &changes[2]);
 }
 
 #[test]
@@ -404,9 +346,9 @@ fn close_removes_the_pull_request_line_from_every_member() {
     assert!(!env.pr(prs[1]).is_open());
     for half in &changes[1..3] {
         assert!(
-            !description(&env, half).contains("Pull Request:"),
+            !env.description(half).contains("Pull Request:"),
             "{half}: {}",
-            description(&env, half)
+            env.description(half)
         );
     }
 }
@@ -431,12 +373,24 @@ fn patch_puts_github_edits_into_the_top_member() {
 
 #[test]
 fn land_from_any_member() {
+    // Landing the lower half of B lands A and all of B, each as one commit
+    // with the Pull Request's title, and sync abandons both halves.
     let env = TestEnv::new();
     let (changes, prs) = stack_with_split_middle(&env);
+    let main = env.branch("main").unwrap();
     env.spr(&["land", "-r", &changes[1], "--yes"]);
-    assert!(env.pr(prs[0]).merged_at.is_some());
-    assert!(env.pr(prs[1]).merged_at.is_some());
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: a.txt", "Change B: b.txt b2.txt"]
+    );
     assert!(env.pr(prs[2]).is_open());
+    assert_eq!(env.pr(prs[2]).base_ref, "main");
+
+    env.spr(&["sync", "-r", &changes[3]]);
+    for change in &changes[..3] {
+        assert!(!env.is_visible(change), "{change} should be abandoned");
+    }
+    assert_eq!(env.parent_of(&changes[3]), env.commit_id("main@origin"));
 }
 
 #[test]
@@ -444,7 +398,7 @@ fn the_pull_request_message_comes_from_the_top_member() {
     let env = TestEnv::new();
     let (changes, _) = stack_with_split_middle(&env);
     let retitle = |change: &str, title: &str| {
-        let text = description(&env, change).replace("Change B", title);
+        let text = env.description(change).replace("Change B", title);
         env.jj(&["describe", "-r", change, "-m", &text]);
     };
     retitle(&changes[1], "Lower half of B");
@@ -495,30 +449,25 @@ fn moving_a_pull_request_above_the_one_on_it_appends_its_steps() {
     env.jj(&["rebase", "-s", &b1, "-d", &c]);
     env.jj(&["new", &b2]);
     env.spr(&["diff", "--all", "-m", "reorder"]);
-    check_pr(&env, q, "main", &["c.txt"], &c);
-    check_pr(&env, p, &env.pr(q).head_ref, &["b1.txt", "b2.txt"], &b2);
-    assert_eq!(pr_commits(&env, p), vec!["Change b1", "Change b2"]);
+    env.check_pr(q, "main", &["c.txt"], &c);
+    env.check_pr(p, &env.pr(q).head_ref, &["b1.txt", "b2.txt"], &b2);
+    assert_eq!(env.pr_commits(p), vec!["Change b1", "Change b2"]);
 }
 
-fn change_added_on_top() {
+#[test]
+fn a_change_added_on_top_is_appended_as_its_own_commit() {
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b"]);
     let prs = env.prs_for(&changes);
-    let before = pr_commits(&env, prs[1]);
+    let before = env.pr_commits(prs[1]);
     env.jj(&["new", &changes[1]]);
     let top = commit_into_pull_request(&env, &changes[1], "More of B", "b2.txt");
 
     env.spr(&["diff", "--all", "-m", "unused"]);
     let mut expected = before;
     expected.push("More of B".to_string());
-    assert_eq!(pr_commits(&env, prs[1]), expected);
-    check_pr(
-        &env,
-        prs[1],
-        &env.pr(prs[1]).base_ref,
-        &["b.txt", "b2.txt"],
-        &top,
-    );
+    assert_eq!(env.pr_commits(prs[1]), expected);
+    env.check_pr(prs[1], &env.pr(prs[1]).base_ref, &["b.txt", "b2.txt"], &top);
     // The Pull Request keeps the title it was opened with, which is no
     // longer its top change's. That is not reported as a difference.
     assert_eq!(env.pr(prs[1]).title, "Change B");
@@ -532,14 +481,10 @@ fn change_added_on_top() {
     assert!(!out.text.contains("differ"), "{}", out.text);
 }
 
-#[test]
-fn a_change_added_on_top_is_appended_as_its_own_commit() {
-    change_added_on_top();
-}
-
 /// A, submitted alone, then B1, B2 and B3 above it, submitted with
 /// `--one-pr`.
-fn one_pr_above_another() {
+#[test]
+fn one_pr_opens_one_pull_request_with_a_commit_per_change() {
     let env = TestEnv::new();
     let a = env.commit("Change A", "a.txt", "a\n");
     env.spr(&["diff", "-r", &a, "-m", "A"]);
@@ -558,15 +503,9 @@ fn one_pr_above_another() {
     let pr = env.pr(pb);
     assert_eq!(pr.title, "Change b3");
     assert_eq!(pr.base_ref, env.pr(pa).head_ref);
-    check_pr(
-        &env,
-        pb,
-        &pr.base_ref,
-        &["b1.txt", "b2.txt", "b3.txt"],
-        &b[2],
-    );
+    env.check_pr(pb, &pr.base_ref, &["b1.txt", "b2.txt", "b3.txt"], &b[2]);
     assert_eq!(
-        pr_commits(&env, pb),
+        env.pr_commits(pb),
         vec!["Change b1", "Change b2", "Change b3"]
     );
 
@@ -581,11 +520,6 @@ fn one_pr_above_another() {
 }
 
 #[test]
-fn one_pr_opens_one_pull_request_with_a_commit_per_change() {
-    one_pr_above_another();
-}
-
-#[test]
 fn one_pr_on_main() {
     let env = TestEnv::new();
     let a1 = env.commit("Change a1", "a1.txt", "a1\n");
@@ -593,8 +527,8 @@ fn one_pr_on_main() {
     env.spr(&["diff", "--all", "--one-pr", "-m", "unused"]);
     let pr = env.pr_for(&a2);
     assert_eq!(env.pr_for(&a1), pr);
-    check_pr(&env, pr, "main", &["a1.txt", "a2.txt"], &a2);
-    assert_eq!(pr_commits(&env, pr), vec!["Change a1", "Change a2"]);
+    env.check_pr(pr, "main", &["a1.txt", "a2.txt"], &a2);
+    assert_eq!(env.pr_commits(pr), vec!["Change a1", "Change a2"]);
 }
 
 #[test]
@@ -617,11 +551,8 @@ fn one_pr_adds_new_changes_to_a_pull_request() {
     assert_eq!(env.pr_for(&more), pr);
     assert_eq!(env.pr_for(&most), pr);
     assert_eq!(env.pr(pr).title, "Change A", "the title is not updated");
-    check_pr(&env, pr, "main", &["a.txt", "a2.txt", "a3.txt"], &most);
-    assert_eq!(
-        pr_commits(&env, pr),
-        vec!["first", "More of A", "Most of A"]
-    );
+    env.check_pr(pr, "main", &["a.txt", "a2.txt", "a3.txt"], &most);
+    assert_eq!(env.pr_commits(pr), vec!["first", "More of A", "Most of A"]);
 }
 
 #[test]
@@ -649,7 +580,7 @@ fn one_pr_refuses_changes_without_a_description() {
     assert!(out.flat().contains("no description"), "{}", out.text);
     assert!(out.text.contains(&env.commit_id(&b1)[..7]), "{}", out.text);
     assert!(!out.text.contains("Created new"), "{}", out.text);
-    assert_eq!(description(&env, &b2).trim(), "Change b2");
+    assert_eq!(env.description(&b2).trim(), "Change b2");
 }
 
 #[test]
@@ -678,7 +609,7 @@ fn steps_survive_github_rebase_after_a_stacked_merge() {
     env.spr(&["land", "-r", &a]);
     assert_eq!(env.pr(pb).base_ref, "main", "GitHub retargets the stack");
     assert_eq!(
-        pr_commits(&env, pb),
+        env.pr_commits(pb),
         vec!["Change b1", "Change b2", "Change b3"],
         "GitHub replays the steps"
     );
@@ -695,15 +626,9 @@ fn steps_survive_github_rebase_after_a_stacked_merge() {
         "-m",
         "unused",
     ]);
-    check_pr(
-        &env,
-        pb,
-        "main",
-        &["b1.txt", "b2.txt", "b3.txt", "b4.txt"],
-        &b4,
-    );
+    env.check_pr(pb, "main", &["b1.txt", "b2.txt", "b3.txt", "b4.txt"], &b4);
     assert_eq!(
-        pr_commits(&env, pb),
+        env.pr_commits(pb),
         vec!["Change b1", "Change b2", "Change b3", "Change b4"]
     );
 }
@@ -732,14 +657,14 @@ fn amending_a_middle_member_appends_one_commit() {
 
     let dry = env.spr(&["diff", "--all", "--dry-run"]);
     assert!(dry.flat().contains(&format!("#{pr}")), "{}", dry.text);
-    assert_eq!(pr_commits(&env, pr).len(), 3, "a dry run pushes nothing");
+    assert_eq!(env.pr_commits(pr).len(), 3, "a dry run pushes nothing");
 
     env.spr(&["diff", "--all", "-m", "review feedback"]);
     assert_eq!(
-        pr_commits(&env, pr),
+        env.pr_commits(pr),
         vec!["Change b1", "Change b2", "Change b3", "review feedback"]
     );
-    check_pr(&env, pr, "main", &["b1.txt", "b2.txt", "b3.txt"], &b[2]);
+    env.check_pr(pr, "main", &["b1.txt", "b2.txt", "b3.txt"], &b[2]);
 }
 
 #[test]
@@ -774,7 +699,7 @@ fn adopting_a_stack_pushed_with_jj_git_push() {
         for change in members {
             let text = format!(
                 "{}\n\nPull Request: https://github.com/fake/repo/pull/{pr}",
-                description(&env, change).trim()
+                env.description(change).trim()
             );
             env.jj(&["describe", "-r", change, "-m", &text]);
         }
@@ -816,13 +741,13 @@ fn adopting_a_stack_pushed_with_jj_git_push() {
             format!("feature-{}", i - 1)
         };
         assert_eq!(env.pr(*pr).base_ref, base);
-        assert_eq!(pr_tree(&env, *pr), local_tree(&env, &tops[i]), "#{pr}");
+        assert_eq!(env.tree_of_pr(*pr), env.tree_of(&tops[i]), "#{pr}");
         assert!(
             env.is_ancestor(&heads_before[i], &env.head_of(*pr)),
             "#{pr}"
         );
     }
-    assert_eq!(pr_commits(&env, prs[1]).last().unwrap(), "review");
+    assert_eq!(env.pr_commits(prs[1]).last().unwrap(), "review");
     assert_eq!(env.active_stacks(), vec![prs.clone()]);
     let divergent = env.jj_query(&[
         "log",
@@ -844,7 +769,7 @@ fn adopting_a_stack_pushed_with_jj_git_push() {
     env.jj(&["rebase", "-s", &live(&changes[0][0]), "-d", "main@origin"]);
     env.spr(&["diff", "--all", "-m", "rebase"]);
     for (i, pr) in prs.iter().enumerate() {
-        assert_eq!(pr_tree(&env, *pr), local_tree(&env, &tops[i]), "#{pr}");
+        assert_eq!(env.tree_of_pr(*pr), env.tree_of(&tops[i]), "#{pr}");
     }
     assert_eq!(env.active_stacks(), vec![prs.clone()]);
     let bookmarks = env.jj_query(&["bookmark", "list"]);
@@ -863,7 +788,7 @@ fn adopting_a_stack_pushed_with_jj_git_push() {
         "unused",
     ]);
     let pw = env.pr_for(&w2);
-    check_pr(&env, pw, "feature-2", &["w1.txt", "w2.txt"], &w2);
+    env.check_pr(pw, "feature-2", &["w1.txt", "w2.txt"], &w2);
     let mut stacked = prs.clone();
     stacked.push(pw);
     assert_eq!(env.active_stacks(), vec![stacked]);
@@ -929,7 +854,8 @@ fn tops_of(groups: &[Vec<String>]) -> String {
     tips(&groups.iter().map(|g| &g[2]).collect::<Vec<_>>())
 }
 
-fn tips_open_a_stack() {
+#[test]
+fn tips_open_a_stack_of_pull_requests_of_several_changes() {
     let env = TestEnv::new();
     let groups = nine_changes(&env);
     let above = env.commit("Change d1", "d1.txt", "d1\n");
@@ -943,19 +869,19 @@ fn tips_open_a_stack() {
         for (change, title) in group.iter().zip(&titles) {
             assert_eq!(env.pr_for(change), pr, "{change} links #{pr}");
             assert!(
-                description(&env, change).starts_with(&format!("{title}\n")),
+                env.description(change).starts_with(&format!("{title}\n")),
                 "{change} keeps its description"
             );
         }
         assert_eq!(env.pr(pr).title, titles[2]);
         let files: Vec<String> = (1..=3).map(|i| format!("{name}{i}.txt")).collect();
         let files: Vec<&str> = files.iter().map(String::as_str).collect();
-        check_pr(&env, pr, &base, &files, &group[2]);
-        assert_eq!(pr_commits(&env, pr), titles);
+        env.check_pr(pr, &base, &files, &group[2]);
+        assert_eq!(env.pr_commits(pr), titles);
         base = env.pr(pr).head_ref;
     }
     assert!(
-        !description(&env, &above).contains("Pull Request:"),
+        !env.description(&above).contains("Pull Request:"),
         "a change above the topmost tip is not submitted"
     );
     assert_eq!(env.active_stacks(), vec![prs.clone()]);
@@ -980,11 +906,6 @@ fn tips_open_a_stack() {
 }
 
 #[test]
-fn tips_open_a_stack_of_pull_requests_of_several_changes() {
-    tips_open_a_stack();
-}
-
-#[test]
 fn tips_add_new_changes_above_and_below_a_pull_request() {
     // a4 goes above a3 and b0 below b1. With a4 as the first tip, a4 joins
     // the Pull Request of a1..a3 at the top and b0 that of b1..b3 at the
@@ -1004,25 +925,22 @@ fn tips_add_new_changes_above_and_below_a_pull_request() {
     assert_eq!(env.pr_for(&a4), prs[0]);
     assert_eq!(env.pr_for(&b0), prs[1]);
     assert_eq!(
-        pr_commits(&env, prs[0]),
+        env.pr_commits(prs[0]),
         vec!["Change a1", "Change a2", "Change a3", "Change a4"]
     );
-    check_pr(
-        &env,
+    env.check_pr(
         prs[0],
         "main",
         &["a1.txt", "a2.txt", "a3.txt", "a4.txt"],
         &a4,
     );
-    check_pr(
-        &env,
+    env.check_pr(
         prs[1],
         &env.pr(prs[0]).head_ref,
         &["b0.txt", "b1.txt", "b2.txt", "b3.txt"],
         &groups[1][2],
     );
-    check_pr(
-        &env,
+    env.check_pr(
         prs[2],
         &env.pr(prs[1]).head_ref,
         &["c1.txt", "c2.txt", "c3.txt"],
@@ -1114,15 +1032,14 @@ fn swap_two_pull_requests_of_two_changes_and_land() {
         "-m",
         "swap",
     ]);
-    check_pr(&env, prs[1], "main", &["b1.txt", "b2.txt"], &groups[1][1]);
-    check_pr(
-        &env,
+    env.check_pr(prs[1], "main", &["b1.txt", "b2.txt"], &groups[1][1]);
+    env.check_pr(
         prs[0],
         &env.pr(prs[1]).head_ref,
         &["a1.txt", "a2.txt"],
         &groups[0][1],
     );
-    assert_eq!(pr_commits(&env, prs[0]), vec!["Change a1", "Change a2"]);
+    assert_eq!(env.pr_commits(prs[0]), vec!["Change a1", "Change a2"]);
 
     env.spr(&["land", "-r", &groups[0][1], "--yes"]);
     for &pr in &prs {
@@ -1133,21 +1050,9 @@ fn swap_two_pull_requests_of_two_changes_and_land() {
             state.closed_reason
         );
     }
-    let landed = env.remote_git(&[
-        "log",
-        "--reverse",
-        "--format=%x00%s",
-        "--name-only",
-        &format!("{main}..main"),
-    ]);
-    let landed: Vec<String> = landed
-        .split('\0')
-        .map(|commit| commit.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|commit| !commit.is_empty())
-        .collect();
     assert_eq!(
-        landed,
-        vec!["Change b2 b1.txt b2.txt", "Change a2 a1.txt a2.txt"],
+        env.landed_since(&main),
+        vec!["Change b2: b1.txt b2.txt", "Change a2: a1.txt a2.txt"],
         "each Pull Request lands as one commit with its own files"
     );
 }
@@ -1207,5 +1112,5 @@ fn tips_dry_run_pushes_nothing() {
             .any(|b| b.starts_with("spr/")),
         "nothing may be pushed"
     );
-    assert!(!description(&env, &groups[0][2]).contains("Pull Request:"));
+    assert!(!env.description(&groups[0][2]).contains("Pull Request:"));
 }

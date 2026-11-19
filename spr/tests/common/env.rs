@@ -286,7 +286,7 @@ impl TestEnv {
     // -- observations ------------------------------------------------------
 
     pub fn pr_for(&self, change: &str) -> u64 {
-        let description = self.jj_query(&["log", "--no-graph", "-r", change, "-T", "description"]);
+        let description = self.description(change);
         description
             .lines()
             .find_map(|line| line.strip_prefix("Pull Request:"))
@@ -299,6 +299,40 @@ impl TestEnv {
 
     pub fn prs_for(&self, changes: &[String]) -> Vec<u64> {
         changes.iter().map(|c| self.pr_for(c)).collect()
+    }
+
+    /// A change's description.
+    pub fn description(&self, change: &str) -> String {
+        self.jj_query(&["log", "--no-graph", "-r", change, "-T", "description"])
+    }
+
+    /// The subjects of the commits on a Pull Request's branch that are not
+    /// on its base branch, oldest first.
+    pub fn pr_commits(&self, number: u64) -> Vec<String> {
+        let pr = self.pr(number);
+        self.remote_git(&[
+            "log",
+            "--reverse",
+            "--format=%s",
+            &format!("{}..{}", pr.base_ref, pr.head_ref),
+        ])
+        .lines()
+        .map(str::to_string)
+        .collect()
+    }
+
+    /// A Pull Request is open, targets `base`, shows `files`, and has the
+    /// tree of `top`, its top change.
+    pub fn check_pr(&self, number: u64, base: &str, files: &[&str], top: &str) {
+        let pr = self.pr(number);
+        assert!(pr.is_open(), "PR #{number} is {}", pr.state);
+        assert_eq!(pr.base_ref, base, "PR #{number}'s base");
+        assert_eq!(self.pr_files(number), files, "files in PR #{number}'s diff");
+        assert_eq!(
+            self.tree_of_pr(number),
+            self.tree_of(top),
+            "PR #{number}'s tree"
+        );
     }
 
     pub fn pr(&self, number: u64) -> PullRequest {
@@ -420,6 +454,11 @@ impl TestEnv {
             &["rev-parse", &format!("{commit}^{{tree}}")],
         );
         outcome.text.trim().to_string()
+    }
+
+    /// The tree of a Pull Request's head.
+    pub fn tree_of_pr(&self, number: u64) -> String {
+        self.remote_git(&["rev-parse", &format!("{}^{{tree}}", self.head_of(number))])
     }
 
     /// The commit ID of a change's parent.

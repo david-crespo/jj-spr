@@ -190,7 +190,8 @@ fn reorder() {
 
 /// Submit a, b, and c, reorder them locally to `order` (indexes into a, b,
 /// and c, bottom first), submit again, and land the whole stack. Each Pull
-/// Request has to reach main as its own commit with only its own file.
+/// Request has to reach main as its own commit, titled for it, with only its
+/// own file.
 fn reorder_and_land(order: [usize; 3]) {
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b", "c"]);
@@ -220,27 +221,9 @@ fn reorder_and_land(order: [usize; 3]) {
             pr.closed_reason
         );
     }
-    let titles = ["Change A", "Change B", "Change C"];
-    let expected: Vec<String> = order
-        .iter()
-        .map(|&i| landed_message(prs[i], titles[i]))
-        .collect();
-    assert_eq!(messages_on_main_since(&env, &main), expected);
-    let files: Vec<String> = env
-        .remote_git(&[
-            "log",
-            "--reverse",
-            "--format=%x00",
-            "--name-only",
-            &format!("{main}..main"),
-        ])
-        .split('\0')
-        .map(|names| names.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|names| !names.is_empty())
-        .collect();
-    let names = ["a.txt", "b.txt", "c.txt"];
-    let expected: Vec<String> = order.iter().map(|&i| names[i].to_string()).collect();
-    assert_eq!(files, expected, "the files of each commit on main");
+    let landed = ["Change A: a.txt", "Change B: b.txt", "Change C: c.txt"];
+    let expected: Vec<&str> = order.iter().map(|&i| landed[i]).collect();
+    assert_eq!(env.landed_since(&main), expected);
 }
 
 #[test]
@@ -625,6 +608,22 @@ fn land_refuses_a_chained_pull_request_without_a_stack() {
     );
     let after: Vec<String> = prs.iter().map(|&n| env.pr(n).base_ref).collect();
     assert_eq!(after, bases, "bases must be unchanged");
+
+    // Following the advice lands each as its own commit.
+    let main = env.branch("main").unwrap();
+    let out = env.spr(&["land", "-r", &changes[0]]);
+    assert!(
+        out.flat()
+            .contains(&format!("#{} now targets main", prs[1])),
+        "{}",
+        out.text
+    );
+    env.spr(&["sync"]);
+    env.spr(&["land", "-r", &changes[1]]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: a.txt", "Change B: b.txt"]
+    );
 }
 
 #[test]
@@ -790,35 +789,54 @@ fn land_gives_up_when_github_does_not_compute_mergeability() {
 
 #[test]
 fn land_stops_at_a_pull_request_github_closed() {
-    // B's commit moves into A's branch, and B's branch gets a merge on top,
-    // the shape older versions of jj-spr pushed after a reorder. After A
+    // A, B, C reordered to A, C, B and pushed the way older versions of
+    // jj-spr did: C's branch, which has B's commit in it, gets a commit that
+    // takes B's file out, and B's branch gets a merge with C's. After A
     // merges, GitHub's rebase finds no commits of B's own and closes B.
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b", "c"]);
     let prs = env.prs_for(&changes);
-    let (a_head, b_head) = (env.head_of(prs[0]), env.head_of(prs[1]));
-    let b_tree = format!("{b_head}^{{tree}}");
-    let merge = env.remote_git(&[
+    let (b_head, c_head) = (env.head_of(prs[1]), env.head_of(prs[2]));
+    env.jj(&["rebase", "-r", &changes[1], "--insert-after", &changes[2]]);
+    env.jj(&["new", &changes[1]]);
+    let git = |args: &[&str]| env.git_in(&env.work, args);
+    let c_update = git(&[
         "commit-tree",
-        &b_tree,
+        &env.tree_of(&changes[2]),
+        "-p",
+        &c_head,
+        "-m",
+        "reorder",
+    ]);
+    let b_update = git(&[
+        "commit-tree",
+        &env.tree_of(&changes[1]),
         "-p",
         &b_head,
         "-p",
-        &a_head,
+        &c_update,
         "-m",
-        "merge",
+        "reorder",
     ]);
-    let branch = |n: u64| format!("refs/heads/{}", env.pr(n).head_ref);
-    env.remote_git(&["update-ref", &branch(prs[1]), &merge]);
-    env.remote_git(&["update-ref", &branch(prs[0]), &b_head]);
+    let branches: Vec<String> = prs.iter().map(|&n| env.pr(n).head_ref).collect();
+    env.push_commit(&c_update, &branches[2]);
+    env.push_commit(&b_update, &branches[1]);
+    {
+        let mut state = env.gh.state();
+        state.stacks.clear();
+        state.prs.get_mut(&prs[2]).unwrap().base_ref = branches[0].clone();
+        state.prs.get_mut(&prs[1]).unwrap().base_ref = branches[2].clone();
+        state.stack_outside_spr(&[prs[0], prs[2], prs[1]]);
+    }
+    let main = env.branch("main").unwrap();
 
-    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
+    let out = env.try_spr(&["land", "-r", &changes[1], "--yes"]);
     assert!(!out.success, "land should stop:\n{}", out.text);
     let text = out.flat();
     assert!(
         text.contains(&format!(
-            "Landed #{}, but not #{}, #{}",
-            prs[0], prs[1], prs[2]
+            "Landed #{}, #{}, but not #{}",
+            prs[0], prs[2], prs[1]
         )),
         "{}",
         out.text
@@ -832,6 +850,39 @@ fn land_stops_at_a_pull_request_github_closed() {
         out.text
     );
     assert!(!text.contains("has not finished computing"), "{}", out.text);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: a.txt", "Change C: c.txt"]
+    );
+
+    // The way out: sync, then a new Pull Request for B. Its old branch is
+    // still on GitHub, so the new one gets another name.
+    let main = env.branch("main").unwrap();
+    let out = env.spr(&["sync"]);
+    assert!(
+        out.flat().contains(&format!(
+            "#{} was closed without merging; keeping it",
+            prs[1]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(!env.is_visible(&changes[0]) && !env.is_visible(&changes[2]));
+    let out = env.try_spr(&["diff", "--all", "-m", "reopen B"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!("#{} is closed", prs[1])),
+        "{}",
+        out.text
+    );
+    env.jj(&["describe", "-r", &changes[1], "-m", "Change B"]);
+    env.spr(&["diff", "--all", "-m", "reopen B"]);
+    let reopened = env.pr_for(&changes[1]);
+    assert_ne!(reopened, prs[1], "B gets a new Pull Request");
+    assert_ne!(env.pr(reopened).head_ref, branches[1]);
+    env.check_pr(reopened, "main", &["b.txt"], &changes[1]);
+    env.spr(&["land", "-r", &changes[1]]);
+    assert_eq!(env.landed_since(&main), vec!["Change B: b.txt"]);
 }
 
 #[test]
@@ -852,6 +903,28 @@ fn land_refuses_when_github_requires_a_review() {
         out.text
     );
     assert!(env.pr(prs[0]).is_open());
+}
+
+#[test]
+fn land_needs_an_approval_when_the_repository_requires_one() {
+    let env = TestEnv::new();
+    env.jj(&["config", "set", "--repo", "spr.requireApproval", "true"]);
+    let a = env.commit("Change A", "a.txt", "a\n");
+    env.spr(&["diff", "-r", &a, "-m", "A"]);
+    let pr = env.pr_for(&a);
+
+    let out = env.try_spr(&["land", "-r", &a]);
+    assert!(!out.success, "land should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!("#{pr} has not been approved")),
+        "{}",
+        out.text
+    );
+    assert!(env.pr(pr).is_open());
+
+    env.gh.state().review(pr, "bob", "APPROVED");
+    env.spr(&["land", "-r", &a]);
+    assert!(env.pr(pr).merged_at.is_some(), "A should be merged");
 }
 
 #[test]
@@ -953,4 +1026,145 @@ fn land_after_resolving_a_conflict_with_the_change_below() {
         env.remote_git(&["show", "main:f.txt"]),
         "1 A\n2\n3 A+B\n4\n5 C"
     );
+}
+
+#[test]
+fn amend_the_bottom_change_then_land_it_and_the_rest() {
+    // The amend gives B and C a merge commit each. After A merges, GitHub
+    // replays B and C without those, which is what the local changes are
+    // after a sync, so there is nothing to push before landing the rest.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    std::fs::write(env.work.join("a.txt"), "a, amended\n").unwrap();
+    env.jj(&["squash", "--into", &changes[0]]);
+    env.spr(&["diff", "--all", "-m", "amend A"]);
+
+    env.spr(&["land", "-r", &changes[0]]);
+    env.spr(&["sync"]);
+    let heads: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    let out = env.spr(&["diff", "--all", "-m", "after sync"]);
+    assert_eq!(
+        out.text.matches("No update necessary").count(),
+        2,
+        "{}",
+        out.text
+    );
+    let after: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    assert_eq!(after, heads, "nothing should be pushed");
+
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: a.txt", "Change B: b.txt", "Change C: c.txt"]
+    );
+    assert_eq!(env.remote_git(&["show", "main:a.txt"]), "a, amended");
+}
+
+#[test]
+fn insert_a_pull_request_in_the_middle_and_land() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let main = env.branch("main").unwrap();
+    env.jj(&["new", "--insert-after", &changes[0], "-m", "Change X"]);
+    std::fs::write(env.work.join("x.txt"), "x\n").unwrap();
+    let x = env.change_id("@");
+    env.jj(&["new", &changes[2]]);
+
+    env.spr(&["diff", "--all", "-m", "insert X"]);
+    env.check_chain(&strings(&[&changes[0], &x, &changes[1], &changes[2]]));
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec![
+            "Change A: a.txt",
+            "Change X: x.txt",
+            "Change B: b.txt",
+            "Change C: c.txt"
+        ]
+    );
+}
+
+#[test]
+fn remove_a_pull_request_from_the_middle_and_land() {
+    // B is closed and abandoned. C's branch has B's commit in it, so C's
+    // update takes b.txt out again, and C lands without it.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    let b_branch = env.pr(prs[1]).head_ref;
+    let c_head = env.head_of(prs[2]);
+
+    env.spr(&["close", "-r", &changes[1]]);
+    assert!(!env.pr(prs[1]).is_open(), "B should be closed");
+    assert!(
+        env.branch(&b_branch).is_some(),
+        "C still targets B's branch"
+    );
+    assert!(env.pr(prs[2]).is_open(), "C should stay open");
+    assert_eq!(env.stacks().values().next(), Some(&prs), "B stays listed");
+
+    env.jj(&["abandon", &changes[1]]);
+    env.spr(&["diff", "--all", "-m", "remove B"]);
+    env.check_chain(&strings(&[&changes[0], &changes[2]]));
+    assert!(
+        env.is_ancestor(&c_head, &env.head_of(prs[2])),
+        "C's update should be a fast-forward"
+    );
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: a.txt", "Change C: c.txt"]
+    );
+}
+
+#[test]
+fn move_changes_out_of_a_stack() {
+    // K and L move off J onto main. GitHub does not allow changing K's base
+    // while it is in the stack, and dissolving the stack needs J in the run.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["j", "k", "l"]);
+    let prs = env.prs_for(&changes);
+    let j_head = env.head_of(prs[0]);
+    env.jj(&["rebase", "-s", &changes[1], "-d", "main@origin"]);
+    env.jj(&["new", &changes[2]]);
+    let stacks = env.active_stacks();
+
+    let out = env.try_spr(&["diff", "--all", "-m", "split"]);
+    assert!(!out.success, "diff should refuse:\n{}", out.text);
+    assert!(
+        out.flat().contains(&format!("also contains #{}", prs[0])),
+        "{}",
+        out.text
+    );
+    assert_eq!(env.active_stacks(), stacks, "the stack must be kept");
+
+    let selection = format!("{} | {}::{}", changes[0], changes[1], changes[2]);
+    env.spr(&["diff", "-r", &selection, "-m", "split"]);
+    env.check_chain(&changes[1..]);
+    assert_eq!(env.active_stacks(), vec![prs[1..].to_vec()]);
+    assert!(env.pr(prs[0]).is_open());
+    assert_eq!(env.head_of(prs[0]), j_head, "J should not change");
+}
+
+#[test]
+fn close_deletes_the_branch_and_unlinks_the_change() {
+    let env = TestEnv::new();
+    let a = env.commit("Change A", "a.txt", "a\n");
+    env.spr(&["diff", "-r", &a, "-m", "A"]);
+    let pr = env.pr_for(&a);
+    let branch = env.pr(pr).head_ref;
+
+    env.spr(&["close", "-r", &a]);
+    assert!(!env.pr(pr).is_open());
+    assert!(env.pr(pr).merged_at.is_none());
+    assert!(
+        env.branch(&branch).is_none(),
+        "the branch should be deleted"
+    );
+    let description = env.jj_query(&["log", "--no-graph", "-r", &a, "-T", "description"]);
+    assert_eq!(description.trim(), "Change A");
+    assert_eq!(env.files_in(&a), vec!["a.txt"], "the change is kept");
 }
