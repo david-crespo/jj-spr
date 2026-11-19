@@ -36,8 +36,7 @@ pub struct Cli {
     github_repository: Option<String>,
 
     /// prefix to be used for branches created for pull requests (if not given
-    /// taken from jj config spr.branchPrefix, defaulting to
-    /// 'spr/<GITHUB_USERNAME>/')
+    /// taken from config spr.branchPrefix, which `jj spr init` sets)
     #[clap(long)]
     branch_prefix: Option<String>,
 
@@ -149,7 +148,9 @@ pub async fn spr() -> Result<()> {
 
     let github_master_branch = get_config_value("spr.githubMasterBranch", &git_config)
         .unwrap_or_else(|| "main".to_string());
-    let branch_prefix = get_config_value("spr.branchPrefix", &git_config)
+    let branch_prefix = cli
+        .branch_prefix
+        .or_else(|| get_config_value("spr.branchPrefix", &git_config))
         .ok_or_else(|| Error::new("spr.branchPrefix must be configured".to_string()))?;
     let require_approval = get_config_bool("spr.requireApproval", &git_config).unwrap_or(false);
 

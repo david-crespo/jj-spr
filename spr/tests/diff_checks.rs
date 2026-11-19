@@ -422,3 +422,12 @@ fn diff_avoids_a_branch_name_taken_on_github() {
     assert_eq!(env.pr(env.pr_for(&change)).head_ref, "spr/change-a-1");
     assert_eq!(env.branch("spr/change-a"), Some(theirs));
 }
+
+#[test]
+fn the_branch_prefix_flag_replaces_the_setting() {
+    let env = TestEnv::new();
+    let a = env.commit("Change A", "a.txt", "a\n");
+
+    env.spr(&["--branch-prefix", "flag/", "diff", "-r", &a]);
+    assert_eq!(env.pr(env.pr_for(&a)).head_ref, "flag/change-a");
+}

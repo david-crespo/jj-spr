@@ -10,7 +10,8 @@ use lazy_regex::regex;
 
 use crate::{
     config::{
-        AuthTokenSource, get_auth_token_with_source, repository_from_remote_url, set_jj_config,
+        AuthTokenSource, get_auth_token_with_source, get_config_value, repository_from_remote_url,
+        set_jj_config,
     },
     error::{Error, Result, ResultExt},
     output::output,
@@ -107,9 +108,7 @@ pub async fn init() -> Result<()> {
     let remote = dialoguer::Input::<String>::new()
         .with_prompt("Name of remote for GitHub")
         .with_initial_text(
-            config
-                .get_string("spr.githubRemoteName")
-                .ok()
+            get_config_value("spr.githubRemoteName", &config)
                 .unwrap_or_else(|| "origin".to_string()),
         )
         .interact_text()?;
@@ -134,9 +133,7 @@ pub async fn init() -> Result<()> {
         .url()
         .ok()
         .map(String::from);
-    let github_repo = config
-        .get_string("spr.githubRepository")
-        .ok()
+    let github_repo = get_config_value("spr.githubRepository", &config)
         .filter(|value| !value.is_empty())
         .or_else(|| url.as_deref().and_then(repository_from_remote_url))
         .unwrap_or_default();
@@ -167,9 +164,7 @@ pub async fn init() -> Result<()> {
 
     console::Term::stdout().write_line("")?;
 
-    let branch_prefix = config
-        .get_string("spr.branchPrefix")
-        .ok()
+    let branch_prefix = get_config_value("spr.branchPrefix", &config)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("spr/{}/", github_user.login));
 
