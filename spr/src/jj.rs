@@ -158,6 +158,37 @@ impl Jujutsu {
         Ok(ref_names)
     }
 
+    /// The branches on `remote` that match one of `patterns` (globs of full
+    /// ref names, as `git ls-remote` takes them), with their heads, by
+    /// branch name. One request to the remote.
+    pub async fn remote_heads(
+        &self,
+        remote: &str,
+        patterns: &[String],
+    ) -> Result<std::collections::HashMap<String, Oid>> {
+        let output = self
+            .git_command()
+            .args(["ls-remote", "--heads", "--", remote])
+            .args(patterns)
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "git ls-remote failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (oid, name) = line.split_once('\t')?;
+                Some((name.strip_prefix("refs/heads/")?.to_string(), oid))
+            })
+            .map(|(name, oid)| Ok((name, Oid::from_str(oid)?)))
+            .collect()
+    }
+
     pub fn resolve_reference(&self, ref_name: &str) -> Result<Oid> {
         let reference = self.git_repo.find_reference(ref_name)?;
         reference

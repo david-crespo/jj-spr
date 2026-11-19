@@ -410,3 +410,15 @@ fn diff_of_the_last_open_member_of_a_stack_moves_it() {
     assert_eq!(env.pr_files(prs[1]), vec!["b.txt"]);
     assert_eq!(env.active_stacks(), vec![vec![px, prs[1]]]);
 }
+
+#[test]
+fn diff_avoids_a_branch_name_taken_on_github() {
+    let env = TestEnv::new();
+    let change = env.commit("Change A", "a.txt", "a\n");
+    // Pushed by someone else, and never fetched here.
+    let theirs = env.remote_git(&["commit-tree", "main^{tree}", "-m", "Someone else's work"]);
+    env.remote_git(&["update-ref", "refs/heads/spr/change-a", &theirs]);
+    env.spr(&["diff", "-r", &change]);
+    assert_eq!(env.pr(env.pr_for(&change)).head_ref, "spr/change-a-1");
+    assert_eq!(env.branch("spr/change-a"), Some(theirs));
+}

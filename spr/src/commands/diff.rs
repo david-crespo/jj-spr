@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::iter::zip;
+use std::{collections::HashSet, iter::zip};
 
 use crate::{
     error::{Error, Result, ResultExt, add_error},
@@ -426,6 +426,8 @@ pub async fn diff(
         }
     }
 
+    let mut taken_branches = taken_branch_names(jj, config, &pull_requests).await?;
+
     // A natively stacked bottom change targets its parent's Pull Request,
     // which has to exist and be open.
     let outside_parent = if native
@@ -577,6 +579,7 @@ pub async fn diff(
             resolved,
             master_base_oid,
             pull_request,
+            &mut taken_branches,
             native,
             if stacked_on_parent {
                 parent.as_ref()
@@ -682,6 +685,38 @@ pub async fn diff(
     }
 
     result
+}
+
+/// The branch names a new Pull Request's branch must not take, from one
+/// request to GitHub: the branches with jj-spr's prefix on GitHub and in
+/// this repository, and those of the existing Pull Requests. Empty when
+/// every Pull Request exists.
+async fn taken_branch_names(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    pull_requests: &[Option<PullRequest>],
+) -> Result<HashSet<String>> {
+    if pull_requests.iter().all(Option::is_some) {
+        return Ok(HashSet::new());
+    }
+    let pattern = format!("refs/heads/{}*", config.branch_prefix);
+    let on_github = jj.remote_heads(&config.remote_name, &[pattern]).await?;
+
+    let remote_prefix = format!("refs/remotes/{}/", config.remote_name);
+    let mut taken: HashSet<String> = jj
+        .get_all_ref_names()?
+        .iter()
+        .filter_map(|name| name.strip_prefix(&remote_prefix))
+        .map(String::from)
+        .collect();
+    taken.extend(on_github.into_keys());
+    taken.extend(
+        pull_requests
+            .iter()
+            .flatten()
+            .map(|pr| pr.head.branch_name().to_string()),
+    );
+    Ok(taken)
 }
 
 /// Predict each selected Pull Request's base branch after this run, for
@@ -1001,6 +1036,7 @@ async fn diff_impl(
     resolved: Resolved,
     master_base_oid: Oid,
     pull_request: Option<PullRequest>,
+    taken_branches: &mut HashSet<String>,
     native: bool,
     native_parent: Option<&ParentPullRequest>,
 ) -> Result<Published> {
@@ -1062,7 +1098,9 @@ async fn diff_impl(
     let pull_request_branch = match &pull_request {
         Some(pr) => pr.head.clone(),
         None => {
-            config.new_github_branch(&config.get_new_branch_name(&jj.get_all_ref_names()?, title))
+            let name = config.get_new_branch_name(taken_branches, title);
+            taken_branches.insert(name.clone());
+            config.new_github_branch(&name)
         }
     };
 

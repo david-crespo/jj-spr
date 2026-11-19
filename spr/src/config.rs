@@ -9,6 +9,29 @@ use std::collections::HashSet;
 
 use crate::{error::Result, github::GitHubBranch, utils::slugify};
 
+/// The longest slug in a new branch name, in bytes. GitHub refuses a ref
+/// name longer than 255 bytes.
+const MAX_SLUG_LEN: usize = 100;
+
+/// `slug` cut to `MAX_SLUG_LEN`, after its last whole word when that keeps
+/// at least half of it.
+fn cap_slug(slug: &str) -> &str {
+    // A slug is ASCII, so any byte index is a character boundary.
+    if slug.len() <= MAX_SLUG_LEN {
+        return slug;
+    }
+    let cut = &slug[..MAX_SLUG_LEN];
+    let words = if slug.as_bytes()[MAX_SLUG_LEN] == b'-' {
+        cut
+    } else {
+        match cut.rfind('-') {
+            Some(end) if end >= MAX_SLUG_LEN / 2 => &cut[..end],
+            _ => cut,
+        }
+    };
+    words.trim_end_matches('-')
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub owner: String,
@@ -116,8 +139,20 @@ impl Config {
         None
     }
 
-    pub fn get_new_branch_name(&self, existing_ref_names: &HashSet<String>, title: &str) -> String {
-        self.find_unused_branch_name(existing_ref_names, &slugify(title))
+    /// A name for a new Pull Request's branch: the prefix and a slug of
+    /// `title`, cut to `MAX_SLUG_LEN`, with a number added if the name is in
+    /// `taken` (branch names on GitHub and in this repository).
+    pub fn get_new_branch_name(&self, taken: &HashSet<String>, title: &str) -> String {
+        let slug = slugify(title);
+        let slug = cap_slug(&slug);
+        let branch_prefix = &self.branch_prefix;
+        let mut branch_name = format!("{branch_prefix}{slug}");
+        let mut suffix = 0;
+        while taken.contains(&branch_name) {
+            suffix += 1;
+            branch_name = format!("{branch_prefix}{slug}-{suffix}");
+        }
+        branch_name
     }
 
     pub fn get_base_branch_name(
@@ -273,6 +308,34 @@ mod tests {
             "spr/foo/".into(),
             false,
         )
+    }
+
+    #[test]
+    fn new_branch_names_skip_taken_ones() {
+        let config = config_factory();
+        let taken: HashSet<String> = ["spr/foo/add-a", "spr/foo/add-a-1"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            config.get_new_branch_name(&taken, "Add A"),
+            "spr/foo/add-a-2"
+        );
+        assert_eq!(config.get_new_branch_name(&taken, "Add B"), "spr/foo/add-b");
+    }
+
+    #[test]
+    fn long_slugs_are_cut_after_a_word() {
+        let words = "word ".repeat(30);
+        let slug = cap_slug(&slugify(&words)).to_string();
+        assert_eq!(slug, "word-".repeat(20).trim_end_matches('-'));
+        // Ending on a whole word.
+        let exact = format!("{}-more", "x".repeat(100));
+        assert_eq!(cap_slug(&exact), "x".repeat(100));
+        // One long word is cut where it has to be.
+        let long = "y".repeat(150);
+        assert_eq!(cap_slug(&long), "y".repeat(100));
+        assert_eq!(cap_slug("short-slug"), "short-slug");
     }
 
     #[test]
