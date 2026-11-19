@@ -1218,6 +1218,23 @@ impl State {
                 json!({"data": {"repository": {"pullRequests": {
                     "nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}})
             }
+            "PullRequestsForBranchQuery" => {
+                let head = variables["head"].as_str().unwrap_or_default();
+                let nodes: Vec<Value> = self
+                    .prs
+                    .values()
+                    .filter(|pr| pr.head_ref == head)
+                    .map(|pr| {
+                        let state = match (pr.is_open(), pr.merged_at.is_some()) {
+                            (true, _) => "OPEN",
+                            (false, true) => "MERGED",
+                            (false, false) => "CLOSED",
+                        };
+                        json!({"number": pr.number, "state": state, "isCrossRepository": false})
+                    })
+                    .collect();
+                json!({"data": {"repository": {"pullRequests": {"nodes": nodes}}}})
+            }
             "SearchQuery" => {
                 let nodes: Vec<Value> = self
                     .prs

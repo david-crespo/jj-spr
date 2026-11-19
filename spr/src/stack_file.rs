@@ -243,7 +243,12 @@ impl Entry {
             }
             None => String::new(),
         };
-        let (heading, body) = split_heading(&markdown);
+        self.text_from(&markdown)
+    }
+
+    /// The entry's title and body if its body file had `markdown`.
+    pub fn text_from(&self, markdown: &str) -> std::result::Result<(Text, TitleSource), String> {
+        let (heading, body) = split_heading(markdown);
         let (title, source) = match (heading, &self.title) {
             (Some(heading), _) => (heading, TitleSource::Heading),
             (None, Some(title)) if !title.trim().is_empty() => (title.as_str(), TitleSource::Key),
@@ -305,6 +310,11 @@ pub fn describe_problems(name: &str, problems: &[Problem]) -> String {
     text
 }
 
+/// `text` as a string literal in a revset.
+pub fn quote(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Resolve a tip to the one visible change it names: a local bookmark, or a
 /// change ID or a unique prefix of one. The error says why it can't be used.
 pub fn resolve_tip(jj: &Jujutsu, tip: &str) -> std::result::Result<Oid, String> {
@@ -320,9 +330,8 @@ pub fn resolve_tip(jj: &Jujutsu, tip: &str) -> std::result::Result<Oid, String> 
         ));
     }
     let jj_error = |e: Error| format!("The tip '{tip}' could not be resolved: {e}");
-    let quoted = format!("\"{}\"", tip.replace('\\', "\\\\").replace('"', "\\\""));
     match jj
-        .commit_ids(&format!("bookmarks(exact:{quoted})"))
+        .commit_ids(&format!("bookmarks(exact:{})", quote(tip)))
         .map_err(jj_error)?[..]
     {
         [commit] => return Ok(commit),

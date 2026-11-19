@@ -277,7 +277,11 @@ async fn sync_commits(
     }
 
     let mut abandon = vec!["abandon".to_string()];
-    abandon.extend(merged.iter().flat_map(|c| c.members.iter().cloned()));
+    abandon.extend(
+        merged
+            .iter()
+            .flat_map(|c| c.members.iter().map(|id| live(id))),
+    );
     jj.run(&abandon)?;
     for change in &merged {
         let Status::Merged(number) = change.status else {
@@ -357,8 +361,16 @@ fn rebase_onto_main(
     root: &Change,
     count: usize,
 ) -> Result<()> {
-    jj.run(["rebase", "-s", &root.members[0], "-d", trunk])?;
+    jj.run(["rebase", "-s", &live(&root.members[0]), "-d", trunk])?;
     output("⤴️ ", &format!("Rebased {count} change(s) onto {trunk}"))
+}
+
+/// A revset for change `change_id`: its mutable version, when it has one.
+/// A change of an adopted Pull Request has old versions in its branch's
+/// history once jj-spr pushed to the branch. jj shows those as immutable
+/// commits with the same change ID, which `change_id` alone would find too.
+fn live(change_id: &str) -> String {
+    format!("coalesce(change_id({change_id}) & mutable(), change_id({change_id}))")
 }
 
 /// After rebasing `remaining` (bottom first): stop on conflicts, or say what
@@ -372,7 +384,7 @@ fn check_rebased(
     let Some(top) = remaining.last() else {
         return Ok(());
     };
-    let conflicted = jj.conflicted_changes(&format!("{trunk}..{}", top.change_id))?;
+    let conflicted = jj.conflicted_changes(&format!("{trunk}..({})", live(&top.change_id)))?;
     if !conflicted.is_empty() {
         return Err(Error::new(format!(
             "The rebase left conflicts in:\n{conflicted}\nResolve them (for example with \

@@ -202,6 +202,14 @@ pub struct PullRequestStatusQuery;
 )]
 pub struct OpenPullRequestBranchesQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/pull_requests_for_branch.graphql",
+    response_derives = "Debug"
+)]
+pub struct PullRequestsForBranchQuery;
+
 impl GitHub {
     pub fn new(
         config: crate::config::Config,
@@ -683,6 +691,54 @@ impl GitHub {
         }
 
         Ok(pull_requests)
+    }
+
+    /// The Pull Requests in the repository, in any state, whose head is
+    /// `branch` of this repository (not of a fork), with their states.
+    pub async fn get_pull_requests_for_branch(
+        &self,
+        branch: &str,
+    ) -> Result<Vec<(u64, PullRequestState)>> {
+        use pull_requests_for_branch_query::{PullRequestState as State, Variables};
+        let request_body = PullRequestsForBranchQuery::build_query(Variables {
+            owner: self.config.owner.clone(),
+            name: self.config.repo.clone(),
+            head: branch.to_string(),
+        });
+        let response_body: Response<pull_requests_for_branch_query::ResponseData> = self
+            .graphql_client
+            .post(self.config.graphql_url())
+            .json(&request_body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if let Some(errors) = response_body.errors {
+            return Err(graphql_error(
+                errors,
+                &format!("finding the Pull Requests of {branch}"),
+            ));
+        }
+        let nodes = response_body
+            .data
+            .and_then(|data| data.repository)
+            .ok_or_else(|| Error::new("failed to find repository"))?
+            .pull_requests
+            .nodes
+            .unwrap_or_default();
+        Ok(nodes
+            .into_iter()
+            .flatten()
+            .filter(|pr| !pr.is_cross_repository)
+            .map(|pr| {
+                let state = match pr.state {
+                    State::OPEN => PullRequestState::Open,
+                    State::MERGED => PullRequestState::Merged,
+                    _ => PullRequestState::Closed,
+                };
+                (pr.number as u64, state)
+            })
+            .collect())
     }
 
     pub async fn get_open_pr_branch_names(&self) -> Result<HashSet<String>> {

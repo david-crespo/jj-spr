@@ -877,6 +877,305 @@ fn submit_adds_an_entry_in_the_middle() {
     assert_eq!(env.active_stacks(), vec![prs]);
 }
 
+// -- adopt --------------------------------------------------------------------
+
+/// The live version of a change: once jj-spr pushes on top of an adopted
+/// branch, the old versions in that branch's history are visible too.
+fn live(change: &str) -> String {
+    format!("change_id({change}) & mutable()")
+}
+
+/// Whether jj tracks `bookmark@origin`.
+fn tracked(env: &TestEnv, bookmark: &str) -> bool {
+    let listing = env.jj_query(&[
+        "bookmark",
+        "list",
+        "--all-remotes",
+        "-T",
+        "if(remote == \"origin\", tracked ++ \"\\n\")",
+        &format!("exact:{bookmark}"),
+    ]);
+    listing.trim() == "true"
+}
+
+/// A stack pushed the way people do without jj-spr: A (a1, a2) <- B (b1)
+/// <- C (c1, c2), each pushed with `jj git push` to a branch named like its
+/// local bookmark (feat-a, feat-b, feat-c), with a Pull Request opened by
+/// hand and a GitHub stack. a1 was rewritten and force-pushed once. The
+/// stack file has only `tip` and `body`: A's body file matches GitHub, B's
+/// has a different body, and C's has a different title. Returns the
+/// stack, the changes by entry, and the Pull Requests.
+fn pushed_without_spr(env: &TestEnv) -> (Stack<'_>, Vec<Vec<String>>, Vec<u64>) {
+    let names: [&[&str]; 3] = [&["a1", "a2"], &["b1"], &["c1", "c2"]];
+    let mut groups = Vec::new();
+    let mut prs = Vec::new();
+    let mut base = "main".to_string();
+    for (group, letter) in names.iter().zip(["a", "b", "c"]) {
+        let members: Vec<String> = group.iter().map(|n| change(env, n)).collect();
+        let bookmark = format!("feat-{letter}");
+        let top = members.last().unwrap();
+        env.jj(&["git", "push", "--named", &format!("{bookmark}={top}")]);
+        let title = format!("Title of {}", letter.to_uppercase());
+        let mut state = env.gh.state();
+        let number = state.open_pr_outside_spr(&bookmark, &base, &title);
+        state.prs.get_mut(&number).unwrap().body = format!("What {letter} does.");
+        drop(state);
+        prs.push(number);
+        groups.push(members);
+        base = bookmark;
+    }
+    if env.gh.state().stacks_enabled {
+        env.gh.state().stack_outside_spr(&prs);
+    }
+    // The force push, as after a review.
+    env.jj(&["edit", &groups[0][0]]);
+    std::fs::write(env.work.join("a1.txt"), "a1, reviewed\n").unwrap();
+    env.jj(&["new", &groups[2][1]]);
+    env.jj(&["git", "push", "--bookmark", "glob:feat-*"]);
+
+    let stack = Stack::new(env);
+    stack.body("a.md", "# Title of A\n\nWhat a does.\n");
+    stack.body("b.md", "# Title of B\n\nWhat B does, as the file has it.\n");
+    stack.body("c.md", "# The file's title of C\n\nWhat c does.\n");
+    stack.entries(json!([
+        {"tip": "feat-a", "body": "a.md"},
+        {"tip": "feat-b", "body": "b.md"},
+        {"tip": "feat-c", "body": "c.md"},
+    ]));
+    (stack, groups, prs)
+}
+
+#[test]
+fn adopt_takes_over_a_stack_pushed_without_jj_spr() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = pushed_without_spr(&env);
+    let before = heads(&env, &prs);
+    let remote: Vec<String> = ["a", "b", "c"]
+        .iter()
+        .map(|l| env.commit_id(&format!("feat-{l}@origin")))
+        .collect();
+    let stacks = env.stacks();
+    let file = stack.read();
+
+    let out = env.spr(&["stack-file", "adopt", &stack.path, "--dry-run"]);
+    assert_eq!(out.text.matches("Would adopt").count(), 3, "{}", out.text);
+    assert!(
+        out.flat().contains("Would rewrite 5 changes"),
+        "{}",
+        out.text
+    );
+    assert_eq!(stack.read(), file);
+    assert!(tracked(&env, "feat-a"));
+
+    let out = env.spr(&["stack-file", "adopt", &stack.path]);
+    let text = out.flat();
+    assert!(text.contains("Rewrote 5 changes"), "{text}");
+    assert!(!text.contains("Stopped tracking"), "{text}");
+    for (i, &number) in prs.iter().enumerate() {
+        let entry = stack.entry(i);
+        let bookmark = ["feat-a", "feat-b", "feat-c"][i];
+        assert_eq!(entry["pr"], number, "{entry}");
+        assert_eq!(entry["pushed"], remote[i].as_str());
+        assert!(entry["synced"].as_str().unwrap().starts_with("sha256:"));
+        assert!(!tracked(&env, bookmark), "{bookmark} is untracked");
+        assert!(
+            text.contains(&format!("Untracked {bookmark}@origin")),
+            "{}",
+            out.text
+        );
+    }
+    assert!(text.contains("match GitHub's"), "{}", out.text);
+    assert!(text.contains("body differs from GitHub's"), "{}", out.text);
+    assert!(text.contains("title differs from GitHub's"), "{}", out.text);
+    assert_eq!(heads(&env, &prs), before, "adopt changes nothing on GitHub");
+    assert_eq!(env.stacks(), stacks);
+
+    // Again: nothing to do.
+    let adopted = stack.read();
+    env.spr(&["stack-file", "adopt", &stack.path]);
+    assert_eq!(stack.read(), adopted);
+
+    // Nothing changed locally: status and submit agree, and submit keeps
+    // GitHub's title and body.
+    let json = stack.status_json();
+    assert_eq!(json["problems"], json!([]), "{json:#}");
+    for i in 0..3 {
+        assert!(since_pushed(&stack, i).iter().all(|s| s == "unchanged"));
+    }
+    let out = stack.spr("submit", &["-m", "unused"]);
+    assert_eq!(
+        out.text.matches("No update necessary").count(),
+        3,
+        "{}",
+        out.text
+    );
+    assert_eq!(heads(&env, &prs), before);
+    assert_eq!(env.stacks(), stacks);
+    assert_eq!(env.pr(prs[1]).body, "What b does.");
+    assert_eq!(env.pr(prs[2]).title, "Title of C");
+
+    // An edit to a lower change: one commit on A's branch, a merge in each
+    // branch above, no force push, and the same GitHub stack.
+    env.jj(&["edit", &live(&groups[0][1])]);
+    std::fs::write(env.work.join("a2.txt"), "a2, revised\n").unwrap();
+    env.jj(&["new", "feat-c"]);
+    stack.spr("submit", &["-m", "revise a2"]);
+    assert_eq!(env.pr_commits(prs[0]).last().unwrap(), "revise a2");
+    for (i, &number) in prs.iter().enumerate() {
+        let head = env.head_of(number);
+        let parents = env.remote_git(&["log", "-1", "--format=%P", &head]);
+        let expected = match i {
+            0 => before[0].clone(),
+            _ => format!("{} {}", before[i], env.head_of(prs[i - 1])),
+        };
+        assert_eq!(parents, expected, "#{number}");
+        let tip = ["feat-a", "feat-b", "feat-c"][i];
+        assert_eq!(env.tree_of_pr(number), env.tree_of(tip), "#{number}");
+        assert_eq!(stack.entry(i)["pushed"], env.commit_id(tip));
+    }
+    assert_eq!(env.stacks(), stacks);
+    let json = stack.status_json();
+    assert_eq!(json["problems"], json!([]), "{json:#}");
+
+    // Land and sync.
+    let main = env.branch("main").unwrap();
+    stack.spr("land", &[]);
+    let subjects: Vec<String> = main_commits(&env, &main)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(subjects, vec!["Title of A", "Title of B", "Title of C"]);
+    env.remote_git(&["cat-file", "-e", "main:a2.txt"]);
+    stack.spr("sync", &[]);
+    for i in 0..3 {
+        assert_eq!(stack.entry(i)["merged"], true, "{}", stack.entry(i));
+    }
+    for change in groups.iter().flatten() {
+        assert!(
+            !env.is_visible(&live(change)),
+            "{change} should be abandoned"
+        );
+    }
+}
+
+#[test]
+fn adopt_leaves_entries_without_an_open_pull_request_alone() {
+    let env = TestEnv::new();
+    let a = change(&env, "a");
+    env.jj(&["git", "push", "--named", &format!("feat-a={a}")]);
+    let closed = env.gh.state().open_pr_outside_spr("feat-a", "main", "A");
+    env.gh.state().close_on_github(closed);
+    let b = change(&env, "b");
+    env.jj(&["git", "push", "--named", &format!("feat-b={b}")]);
+    let c = change(&env, "c");
+    let stack = Stack::new(&env);
+    stack.entries(json!([
+        {"tip": "feat-a", "title": "A"},
+        {"tip": "feat-b", "title": "B"},
+        {"tip": c, "title": "C"},
+    ]));
+    let file = stack.read();
+
+    let out = env.spr(&["stack-file", "adopt", &stack.path]);
+    let text = out.flat();
+    assert!(text.contains(&format!("#{closed}")), "{}", out.text);
+    assert!(text.contains("is closed"), "{}", out.text);
+    assert!(text.contains("No Pull Request has feat-b"), "{}", out.text);
+    assert!(text.contains("not a local bookmark"), "{}", out.text);
+    assert_eq!(stack.read(), file);
+    assert!(tracked(&env, "feat-b"));
+
+    // They get new Pull Requests on jj-spr's branches.
+    stack.spr("submit", &["-m", "unused"]);
+    let prs = stack.prs();
+    assert!(!prs.contains(&closed));
+    assert_eq!(env.pr(prs[0]).head_ref, "spr/a");
+    assert_eq!(env.pr(prs[1]).head_ref, "spr/b");
+}
+
+#[test]
+fn adopt_can_copy_the_title_and_body_from_github() {
+    let env = TestEnv::new();
+    let (stack, _, prs) = pushed_without_spr(&env);
+    let heads_before = heads(&env, &prs);
+    env.spr(&["stack-file", "adopt", &stack.path, "--copy-github-text"]);
+    let read = |name: &str| std::fs::read_to_string(stack.dir.join(name)).unwrap();
+    assert_eq!(read("a.md"), "# Title of A\n\nWhat a does.\n");
+    assert_eq!(read("b.md"), "# Title of B\n\nWhat b does.\n");
+    assert_eq!(read("c.md"), "# Title of C\n\nWhat c does.\n");
+    let json = stack.status_json();
+    for i in 0..3 {
+        assert_eq!(
+            json["entries"][i]["actions"],
+            json!(["nothing: it is up to date"]),
+            "{json:#}"
+        );
+    }
+
+    // Edited in the file only: submit updates GitHub.
+    stack.body("b.md", "# Title of B\n\nWhat b does, revised.\n");
+    stack.spr("submit", &["-m", "unused"]);
+    assert_eq!(env.pr(prs[1]).body, "What b does, revised.");
+    assert_eq!(heads(&env, &prs), heads_before);
+}
+
+#[test]
+fn close_an_adopted_entry_and_open_a_new_pull_request() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = pushed_without_spr(&env);
+    env.spr(&["stack-file", "adopt", &stack.path]);
+    stack.spr("close", &["--pr", "feat-c"]);
+    assert!(!env.pr(prs[2]).is_open());
+    assert_eq!(env.branch("feat-c"), None, "close deletes the branch");
+    let entry = stack.entry(2);
+    for key in ["pr", "synced", "pushed"] {
+        assert!(entry.get(key).is_none(), "{entry}");
+    }
+    stack.spr("submit", &["-m", "unused"]);
+    let now = stack.prs();
+    assert_eq!(now[..2], prs[..2]);
+    assert!(env.pr(now[2]).head_ref.starts_with("spr/"));
+    assert_eq!(env.pr(now[2]).title, "The file's title of C");
+    env.check_pr(
+        now[2],
+        "feat-b",
+        &["c1.txt", "c2.txt"],
+        &live(&groups[2][1]),
+    );
+    assert_eq!(env.active_stacks(), vec![now]);
+}
+
+#[test]
+fn land_part_of_an_adopted_stack_without_github_stacks_and_sync() {
+    // Without a GitHub stack, nothing rewrites the branches above the landed
+    // Pull Request, so they keep the old versions of their changes, which
+    // jj shows next to the live ones.
+    let env = TestEnv::with_stacks(false);
+    let (stack, groups, prs) = pushed_without_spr(&env);
+    env.spr(&["stack-file", "adopt", &stack.path]);
+    env.jj(&["edit", &live(&groups[0][1])]);
+    std::fs::write(env.work.join("a2.txt"), "a2, revised\n").unwrap();
+    env.jj(&["new", "feat-c"]);
+    stack.spr("submit", &["-m", "revise a2"]);
+
+    stack.spr("land", &["--upto", "feat-a"]);
+    assert!(env.pr(prs[0]).merged_at.is_some());
+    stack.spr("sync", &[]);
+    assert_eq!(stack.entry(0)["merged"], true);
+    assert_eq!(
+        env.parent_of(&format!("({})", live(&groups[1][0]))),
+        env.commit_id("main@origin")
+    );
+    stack.spr("submit", &["-m", "after landing A"]);
+    env.check_pr(prs[1], "main", &["b1.txt"], "feat-b");
+    env.check_pr(prs[2], "feat-b", &["c1.txt", "c2.txt"], "feat-c");
+    stack.spr("land", &[]);
+    stack.spr("sync", &[]);
+    for i in 0..3 {
+        assert_eq!(stack.entry(i)["merged"], true, "{}", stack.entry(i));
+    }
+}
+
 // -- land, sync, and close ----------------------------------------------------
 
 /// The subject and body of each commit on main above `from`, oldest first.

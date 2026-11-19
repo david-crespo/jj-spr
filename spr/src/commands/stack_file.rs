@@ -3,9 +3,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! `jj spr stack-file`: write a new stack file, and show what `jj spr
-//! submit` would do with one. Agents and people edit the file itself; these
-//! keep them from working blind.
+//! `jj spr stack-file`: write a new stack file, show what `jj spr submit`
+//! would do with one, and adopt Pull Requests opened without jj-spr. Agents
+//! and people edit the file itself; these keep them from working blind.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -16,7 +16,8 @@ use crate::{
     error::{Error, Result},
     github::PullRequestState,
     jj::short,
-    stack_file::{Check, Entry, Member, StackFile, base_dir, check},
+    output::output,
+    stack_file::{Check, Entry, Member, StackFile, Text, base_dir, check, quote},
 };
 
 #[derive(Debug, clap::Subcommand)]
@@ -32,6 +33,20 @@ pub enum StackFileCommand {
     /// every problem that would stop submit, and exits with an error when
     /// there is one.
     Status(StatusOptions),
+
+    /// Take over Pull Requests opened without jj-spr
+    ///
+    /// For each entry without a pr key whose tip is a local bookmark, adopt
+    /// finds the open Pull Request in this repository whose branch has the
+    /// bookmark's name. It writes the entry's pr, pushed, and synced keys,
+    /// so that submit updates that Pull Request instead of opening a new
+    /// one. It changes nothing on GitHub. Since synced has the entry's
+    /// current title and body, submit keeps GitHub's where they differ.
+    ///
+    /// It stops tracking the bookmark's remote branch, since jj-spr adds
+    /// commits to that branch from then on, and rewrites the changes on that
+    /// branch so that they stay editable.
+    Adopt(AdoptOptions),
 }
 
 #[derive(Debug, clap::Parser)]
@@ -55,6 +70,22 @@ pub struct StatusOptions {
     /// Print the same as JSON
     #[clap(long)]
     json: bool,
+}
+
+#[derive(Debug, clap::Parser)]
+pub struct AdoptOptions {
+    /// The stack file
+    path: PathBuf,
+
+    /// Write each adopted Pull Request's title and body from GitHub into the
+    /// entry's body file, replacing what the file has
+    #[clap(long)]
+    copy_github_text: bool,
+
+    /// Show what would happen without writing files, changing bookmarks, or
+    /// rewriting changes
+    #[clap(long)]
+    dry_run: bool,
 }
 
 pub fn init(opts: InitOptions, jj: &crate::jj::Jujutsu) -> Result<()> {
@@ -202,6 +233,293 @@ pub async fn status(
         problems.len(),
         if problems.len() == 1 { "" } else { "s" }
     )))
+}
+
+pub async fn adopt(
+    opts: AdoptOptions,
+    jj: &crate::jj::Jujutsu,
+    gh: &crate::github::GitHub,
+    config: &crate::config::Config,
+) -> Result<()> {
+    let mut file = StackFile::read(&opts.path)?;
+    let dir = base_dir(&opts.path);
+    let remote = &config.remote_name;
+    // The tips of the entries adopted in this run.
+    let mut adopted = Vec::new();
+    for index in file.active(None)? {
+        let entry = &file.prs[index];
+        if entry.pr.is_some() {
+            continue;
+        }
+        let tip = entry.tip.clone();
+        if jj
+            .commit_ids(&format!("bookmarks(exact:{})", quote(&tip)))?
+            .len()
+            != 1
+        {
+            output(
+                "➖",
+                &format!("'{tip}' is not a local bookmark, so it has no branch to adopt."),
+            )?;
+            continue;
+        }
+        // What was last pushed, read before fetching the Pull Request moves
+        // the remote-tracking branch to GitHub's head.
+        let pushed = jj
+            .resolve_reference(config.new_github_branch(&tip).local())
+            .ok();
+        let found = gh.get_pull_requests_for_branch(&tip).await?;
+        let open: Vec<u64> = found
+            .iter()
+            .filter(|(_, state)| *state == PullRequestState::Open)
+            .map(|(number, _)| *number)
+            .collect();
+        let number = match open[..] {
+            [number] => number,
+            [] => {
+                for (number, state) in &found {
+                    let what = match state {
+                        PullRequestState::Merged => "has merged",
+                        _ => "is closed",
+                    };
+                    output("➖", &format!("#{number}, from {tip}, {what}."))?;
+                }
+                output(
+                    "➖",
+                    &format!(
+                        "{}Leaving '{tip}' alone: the next submit opens a new Pull Request for it.",
+                        if found.is_empty() {
+                            format!("No Pull Request has {tip} as its branch. ")
+                        } else {
+                            String::new()
+                        }
+                    ),
+                )?;
+                continue;
+            }
+            _ => {
+                output(
+                    "⚠️",
+                    &format!(
+                        "{} are open from {tip}. Leaving '{tip}' alone: set the entry's pr \
+                         to the right one.",
+                        crate::stacks::format_pr_list(&open)
+                    ),
+                )?;
+                continue;
+            }
+        };
+        let pr = gh.get_pull_request(number).await?;
+        let github = Text::new(&pr.title, pr.body.as_deref().unwrap_or_default());
+        output(
+            "#️⃣ ",
+            &format!(
+                "{} #{number} for '{tip}': {}",
+                if opts.dry_run {
+                    "Would adopt"
+                } else {
+                    "Adopted"
+                },
+                config.pull_request_url(number)
+            ),
+        )?;
+
+        let mut text = entry.text(&dir).map(|(text, _)| text);
+        match (&entry.body, opts.copy_github_text) {
+            (Some(body), true) => {
+                let markdown = match github.body.as_str() {
+                    "" => format!("# {}\n", github.title),
+                    body => format!("# {}\n\n{body}\n", github.title),
+                };
+                let path = dir.join(body);
+                if !opts.dry_run {
+                    std::fs::write(&path, &markdown).map_err(|e| {
+                        Error::new(format!("Could not write {}: {e}", path.display()))
+                    })?;
+                }
+                output(
+                    "📝",
+                    &format!(
+                        "{} GitHub's title and body to {}",
+                        if opts.dry_run { "Would copy" } else { "Copied" },
+                        path.display()
+                    ),
+                )?;
+                text = entry.text_from(&markdown).map(|(text, _)| text);
+            }
+            (None, true) => output(
+                "⚠️",
+                &format!(
+                    "The entry of '{tip}' has no body file to copy GitHub's title and body to. \
+                     Add a body key and copy them by hand, since adopt now skips the entry."
+                ),
+            )?,
+            (_, false) => {}
+        }
+        // The file's text as `synced`: submit keeps GitHub's while the file
+        // stays as it is.
+        let synced = match &text {
+            Ok(text) => {
+                let differ = match (text.title != github.title, text.body != github.body) {
+                    (false, false) => None,
+                    (true, false) => Some("title differs"),
+                    (false, true) => Some("body differs"),
+                    (true, true) => Some("title and body differ"),
+                };
+                match differ {
+                    None => output("✅", "The title and body match GitHub's.")?,
+                    Some(differ) => output(
+                        "✋",
+                        &format!(
+                            "The {differ} from GitHub's. The next submit keeps GitHub's \
+                             unless it gets --overwrite-github."
+                        ),
+                    )?,
+                }
+                Some(text.hash())
+            }
+            Err(message) => {
+                output("⚠️", message)?;
+                None
+            }
+        };
+        if pushed.is_none() {
+            output(
+                "⚠️",
+                &format!(
+                    "There is no remote-tracking bookmark {tip}@{remote}, so the entry gets \
+                     no pushed key."
+                ),
+            )?;
+        }
+        let entry = &mut file.prs[index];
+        entry.pr = Some(number);
+        entry.pushed = pushed.map(|oid| oid.to_string());
+        entry.synced = synced;
+        adopted.push(tip);
+    }
+    if !adopted.is_empty() && !opts.dry_run {
+        file.write(&opts.path)?;
+    }
+    untrack_adopted(jj, config, &adopted, opts.dry_run)
+}
+
+/// Stop tracking the remote branches of the bookmarks `adopted`, the tips of
+/// adopted entries. jj-spr adds commits to the branch, and a tracked bookmark
+/// would move to those commits, or become conflicted, on the next fetch.
+///
+/// By default, jj treats the changes on an untracked remote branch as
+/// immutable. The changes that untracking makes immutable are rewritten with
+/// the same content: the new commits are editable, and the old ones are
+/// hidden.
+fn untrack_adopted(
+    jj: &crate::jj::Jujutsu,
+    config: &crate::config::Config,
+    adopted: &[String],
+    dry_run: bool,
+) -> Result<()> {
+    let remote = &config.remote_name;
+    let mut bookmarks = Vec::new();
+    for tip in adopted {
+        let listing = jj.run([
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "-T",
+            &format!("if(remote == {}, tracked ++ \"\\n\")", quote(remote)),
+            &format!("exact:{tip}"),
+        ])?;
+        if listing.trim() == "true" {
+            bookmarks.push(tip.as_str());
+        }
+    }
+    if bookmarks.is_empty() {
+        return Ok(());
+    }
+    let union = |f: &dyn Fn(&str) -> String| {
+        bookmarks
+            .iter()
+            .map(|b| f(b))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let tips = union(&|b| format!("bookmarks(exact:{})", quote(b)));
+    let remotes = union(&|b| {
+        format!(
+            "remote_bookmarks(exact:{}, exact:{})",
+            quote(b),
+            quote(remote)
+        )
+    });
+    let pushed = jj.commit_ids(&format!(
+        "({}..({tips})) & ::({remotes}) & mutable()",
+        config.trunk_revset()
+    ))?;
+    let changes = |n: usize| format!("{n} change{}", if n == 1 { "" } else { "s" });
+    if dry_run {
+        for bookmark in &bookmarks {
+            output("🔖", &format!("Would untrack {bookmark}@{remote}"))?;
+        }
+        if !pushed.is_empty() {
+            output(
+                "♻️ ",
+                &format!(
+                    "Would rewrite {} with the same content if untracking makes them \
+                     immutable, as it does by default",
+                    changes(pushed.len())
+                ),
+            )?;
+        }
+        return Ok(());
+    }
+
+    let mut untrack = vec![
+        "bookmark".to_string(),
+        "untrack".to_string(),
+        "--quiet".to_string(),
+        "--remote".to_string(),
+        remote.clone(),
+    ];
+    untrack.extend(bookmarks.iter().map(|b| format!("exact:{b}")));
+    jj.run(&untrack)?;
+    for bookmark in &bookmarks {
+        output(
+            "🔖",
+            &format!(
+                "Untracked {bookmark}@{remote}, so that {bookmark} stays on your changes \
+                 when jj-spr adds commits to the branch."
+            ),
+        )?;
+    }
+
+    let revset = |oids: &[Oid]| {
+        oids.iter()
+            .map(Oid::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    if pushed.is_empty() {
+        return Ok(());
+    }
+    let now_immutable = jj.commit_ids(&format!("({}) & immutable()", revset(&pushed)))?;
+    if now_immutable.is_empty() {
+        return Ok(());
+    }
+    jj.run([
+        "metaedit",
+        "--force-rewrite",
+        "--ignore-immutable",
+        "--quiet",
+        &revset(&now_immutable),
+    ])?;
+    output(
+        "♻️ ",
+        &format!(
+            "Rewrote {} with the same content, so that they stay editable: jj treats \
+             the changes on an untracked remote branch as immutable.",
+            changes(now_immutable.len())
+        ),
+    )
 }
 
 /// One entry for `status`, as JSON.

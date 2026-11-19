@@ -236,6 +236,9 @@ pub async fn spr() -> Result<()> {
         Commands::StackFile(commands::stack_file::StackFileCommand::Status(opts)) => {
             commands::stack_file::status(opts, &jj, &gh, &config).await?
         }
+        Commands::StackFile(commands::stack_file::StackFileCommand::Adopt(opts)) => {
+            commands::stack_file::adopt(opts, &jj, &gh, &config).await?
+        }
         // The following commands are executed above and return from this
         // function before it reaches this match.
         Commands::Init
