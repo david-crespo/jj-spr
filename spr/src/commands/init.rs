@@ -9,7 +9,9 @@ use indoc::formatdoc;
 use lazy_regex::regex;
 
 use crate::{
-    config::{AuthTokenSource, get_auth_token_with_source, set_jj_config},
+    config::{
+        AuthTokenSource, get_auth_token_with_source, repository_from_remote_url, set_jj_config,
+    },
     error::{Error, Result, ResultExt},
     output::output,
 };
@@ -132,17 +134,11 @@ pub async fn init() -> Result<()> {
         .url()
         .ok()
         .map(String::from);
-    let regex = lazy_regex::regex!(r#"github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(.git)?$"#);
     let github_repo = config
         .get_string("spr.githubRepository")
         .ok()
         .filter(|value| !value.is_empty())
-        .or_else(|| {
-            url.as_ref()
-                .and_then(|url| regex.captures(url))
-                .and_then(|caps| caps.get(1))
-                .map(|m| m.as_str().to_string())
-        })
+        .or_else(|| url.as_deref().and_then(repository_from_remote_url))
         .unwrap_or_default();
 
     let github_repo = dialoguer::Input::<String>::new()

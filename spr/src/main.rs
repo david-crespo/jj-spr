@@ -12,7 +12,7 @@
 use clap::{Parser, Subcommand};
 use jj_spr::{
     commands,
-    config::{get_auth_token, get_config_bool, get_config_value},
+    config::{get_auth_token, get_config_bool, get_config_value, repository_from_remote_url},
     error::{Error, Result, ResultExt},
     output::output,
 };
@@ -106,11 +106,36 @@ pub async fn spr() -> Result<()> {
 
     let git_config = jj.git_repo.config()?;
 
-    // Try to get config from jj first, fall back to git config
-    let github_repository = cli
+    let github_remote_name = get_config_value("spr.githubRemoteName", &git_config)
+        .unwrap_or_else(|| "origin".to_string());
+
+    // The flag, then the setting (jj's config first, then Git's), then the
+    // GitHub remote's URL.
+    let github_repository = match cli
         .github_repository
         .or_else(|| get_config_value("spr.githubRepository", &git_config))
-        .ok_or_else(|| Error::new("spr.githubRepository is not configured"))?;
+    {
+        Some(repository) => repository,
+        None => {
+            let remote = jj.git_repo.find_remote(&github_remote_name).ok();
+            let url = remote.as_ref().and_then(|remote| remote.url().ok());
+            url.and_then(repository_from_remote_url).ok_or_else(|| {
+                Error::new(match url {
+                    Some(url) => format!(
+                        "spr.githubRepository is not configured. The URL of remote \
+                         '{github_remote_name}' ({url}) is not a github.com URL, so the \
+                         repository can't be read from it. Set spr.githubRepository to \
+                         OWNER/REPO."
+                    ),
+                    None => format!(
+                        "spr.githubRepository is not configured, and remote \
+                         '{github_remote_name}' does not exist. Set spr.githubRepository to \
+                         OWNER/REPO, or spr.githubRemoteName to the GitHub remote."
+                    ),
+                })
+            })?
+        }
+    };
 
     let (github_owner, github_repo) = {
         let captures = lazy_regex::regex!(r#"^([\w\-\.]+)/([\w\-\.]+)$"#)
@@ -122,8 +147,6 @@ pub async fn spr() -> Result<()> {
         )
     };
 
-    let github_remote_name = get_config_value("spr.githubRemoteName", &git_config)
-        .unwrap_or_else(|| "origin".to_string());
     let github_master_branch = get_config_value("spr.githubMasterBranch", &git_config)
         .unwrap_or_else(|| "main".to_string());
     let branch_prefix = get_config_value("spr.branchPrefix", &git_config)

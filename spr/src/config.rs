@@ -294,10 +294,52 @@ pub fn set_jj_config(key: &str, value: &str, repo_path: &std::path::Path) -> Res
     }
 }
 
+/// The `owner/repo` of a github.com remote URL, in its HTTPS or SSH form.
+/// `None` for anything else, such as an SSH host alias or a GitHub
+/// Enterprise host: those need `spr.githubRepository`.
+pub fn repository_from_remote_url(url: &str) -> Option<String> {
+    lazy_regex::regex!(r#"(?:^|[/@])github\.com[/:]([\w\-\.]+/[\w\-\.]+?)(?:\.git)?/?$"#)
+        .captures(url)
+        .map(|captures| captures[1].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     // Note this useful idiom: importing names from outer (for mod tests) scope.
     use super::*;
+
+    #[test]
+    fn repository_from_remote_url_reads_github_urls() {
+        for url in [
+            "https://github.com/acme/widgets",
+            "https://github.com/acme/widgets.git",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets",
+        ] {
+            assert_eq!(
+                repository_from_remote_url(url).as_deref(),
+                Some("acme/widgets"),
+                "{url}"
+            );
+        }
+        assert_eq!(
+            repository_from_remote_url("git@github.com:a-b/c.d.git").as_deref(),
+            Some("a-b/c.d")
+        );
+    }
+
+    #[test]
+    fn repository_from_remote_url_rejects_other_urls() {
+        for url in [
+            "work:acme/widgets.git",
+            "https://github.example.com/acme/widgets",
+            "https://gitlab.com/acme/widgets.git",
+            "/tmp/repos/widgets",
+            "https://github.com/acme",
+        ] {
+            assert_eq!(repository_from_remote_url(url), None, "{url}");
+        }
+    }
 
     fn config_factory() -> Config {
         crate::config::Config::new(
