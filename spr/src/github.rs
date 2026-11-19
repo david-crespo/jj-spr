@@ -166,6 +166,8 @@ pub struct PullRequestMergeability {
     pub base: GitHubBranch,
     pub head_oid: git2::Oid,
     pub mergeable: Option<bool>,
+    /// GitHub blocks the merge, for required checks or reviews.
+    pub blocked: bool,
     pub merge_commit: Option<git2::Oid>,
 }
 
@@ -541,6 +543,10 @@ impl GitHub {
                 pull_request_mergeability_query::MergeableState::UNKNOWN => None,
                 _ => None,
             },
+            blocked: matches!(
+                pr.merge_state_status,
+                pull_request_mergeability_query::MergeStateStatus::BLOCKED
+            ),
             merge_commit: pr
                 .merge_commit
                 .and_then(|sha| git2::Oid::from_str(&sha.oid).ok()),

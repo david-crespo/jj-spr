@@ -28,6 +28,9 @@
 //! - when replaying a member's commits would conflict, GitHub rewrites no
 //!   branch at all. It still points the Pull Request above the merged ones
 //!   at the stack's base, and reports that Pull Request as `CONFLICTING`.
+//! - after a stacked merge, GitHub points the next PR at the stack's base a
+//!   few seconds before it pushes the rebased head. In between, it can
+//!   report whether the old head can be merged (`stale_head_polls`).
 //! - a draft cannot be merged: 405 from the ordinary endpoint, and a failed
 //!   merge (400) from `merge-async`
 //! - a PR in the middle of a stack can be closed; the stack still lists it
@@ -130,6 +133,18 @@ pub struct State {
     /// How many more mergeability queries answer `UNKNOWN`, as GitHub does
     /// while it is still computing mergeability.
     pub unknown_mergeability_polls: u32,
+    /// After the next stack merge, how many mergeability queries see the
+    /// Pull Request above the merged ones already targeting the stack's base
+    /// but still at its old head, before the rebase of the rest of the stack
+    /// lands. Live GitHub leaves a gap of 2 to 7 seconds between the two.
+    pub stale_head_polls: u32,
+    /// The rebase of the rest of the stack that `stale_head_polls` holds
+    /// back: the members, the stack's base, and the old head of the top
+    /// merged one.
+    held_rebase: Option<(Vec<u64>, String, String)>,
+    /// Pull Requests whose merge GitHub blocks (for required checks or
+    /// reviews) although they have no conflicts.
+    pub blocked: Vec<u64>,
     /// Head branches whose next Pull Request GitHub refuses to create, once.
     pub failing_creations: Vec<String>,
     pub requests: Vec<Recorded>,
@@ -477,6 +492,7 @@ impl State {
                 json!({"author": {"__typename": "User", "login": login}, "state": state})
             })
             .collect();
+        let conflicting = self.is_conflicting(number);
         json!({
             "number": pr.number,
             "state": state,
@@ -487,7 +503,14 @@ impl State {
             "baseRefName": pr.base_ref,
             "headRefName": pr.head_ref,
             "headRefOid": self.branches().get(&pr.head_ref).unwrap_or(&pr.last_head_sha),
-            "mergeable": if self.is_conflicting(number) { "CONFLICTING" } else { "MERGEABLE" },
+            "mergeable": if conflicting { "CONFLICTING" } else { "MERGEABLE" },
+            "mergeStateStatus": if conflicting {
+                "DIRTY"
+            } else if self.blocked.contains(&number) {
+                "BLOCKED"
+            } else {
+                "CLEAN"
+            },
             "mergeCommit": pr.merge_commit_sha.as_ref().map(|oid| json!({"oid": oid})),
             "latestOpinionatedReviews": {"nodes": reviews},
             "reviewRequests": {"nodes": []},
@@ -783,7 +806,12 @@ impl State {
             }
             below = Some(head);
         }
-        if !self.rebase_members(&survivors, &base_ref, &old_top)
+        if self.stale_head_polls > 0
+            && let Some(next) = survivors.first()
+        {
+            self.prs.get_mut(next).unwrap().base_ref = base_ref.clone();
+            self.held_rebase = Some((survivors, base_ref.clone(), old_top));
+        } else if !self.rebase_members(&survivors, &base_ref, &old_top)
             && let Some(next) = survivors.first()
         {
             self.prs.get_mut(next).unwrap().base_ref = base_ref.clone();
@@ -1185,6 +1213,13 @@ impl State {
         }
         match name {
             "PullRequestQuery" | "PullRequestMergeabilityQuery" => {
+                if name == "PullRequestMergeabilityQuery" && self.held_rebase.is_some() {
+                    if self.stale_head_polls > 0 {
+                        self.stale_head_polls -= 1;
+                    } else if let Some((members, base_ref, old_top)) = self.held_rebase.take() {
+                        self.rebase_members(&members, &base_ref, &old_top);
+                    }
+                }
                 let mut data = variables["number"]
                     .as_u64()
                     .filter(|n| self.prs.contains_key(n))
@@ -1195,6 +1230,7 @@ impl State {
                 {
                     self.unknown_mergeability_polls -= 1;
                     pr["mergeable"] = json!("UNKNOWN");
+                    pr["mergeStateStatus"] = json!("UNKNOWN");
                 }
                 json!({"data": {"repository": {"pullRequest": data}}})
             }
@@ -1319,6 +1355,9 @@ impl FakeGitHub {
             merge_ops: HashMap::new(),
             failing_queries: Vec::new(),
             unknown_mergeability_polls: 0,
+            stale_head_polls: 0,
+            held_rebase: None,
+            blocked: Vec::new(),
             failing_creations: Vec::new(),
             requests: Vec::new(),
             next_number: 1,

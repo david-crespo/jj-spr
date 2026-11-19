@@ -138,9 +138,14 @@ which GitHub shows as one unit in its UI.
   every PR below it, after listing them and asking (pass `--yes` to skip the
   question, which is required outside a terminal). Every PR that would merge
   is checked first: none may be a draft, and each must be approved if
-  `spr.requireApproval` is set. GitHub then retargets the next PR to the main
-  branch and rebases the rest of the stack. Afterwards, run `jj spr sync` and
-  then `jj spr diff --all`.
+  `spr.requireApproval` is set. `land` merges the PRs one at a time, bottom
+  first. After each merge, GitHub retargets the next PR to the main branch and
+  rebases the rest of the stack. `land` waits for that rebase before it
+  merges the next PR. Afterwards, run `jj spr sync` and then
+  `jj spr diff --all`. `land` does not wait for CI. If GitHub blocks a PR for
+  required checks or reviews, `land` stops there and prints which PRs landed.
+  Run `jj spr sync`, then run `jj spr land` again once GitHub allows the
+  merge.
 - If stacked pull requests are not enabled for the repository, the PRs still
   target each other; they just aren't registered as a GitHub stack.
 

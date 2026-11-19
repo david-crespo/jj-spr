@@ -9,6 +9,7 @@ query PullRequestMergeabilityQuery(
       baseRefName
       headRefOid
       mergeable
+      mergeStateStatus
       mergeCommit {
         oid
       }

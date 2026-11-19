@@ -76,15 +76,7 @@ pub async fn land(
     } else {
         return Err(Error::new("This commit does not refer to a Pull Request."));
     };
-    land_pull_request(
-        pull_request_number,
-        opts.yes,
-        "`jj spr sync`",
-        jj,
-        gh,
-        config,
-    )
-    .await
+    land_pull_request(pull_request_number, opts.yes, None, jj, gh, config).await
 }
 
 /// Land the Pull Requests of a stack file's entries, bottom first, up to the
@@ -100,7 +92,6 @@ async fn land_stack_file(
 ) -> Result<()> {
     let file = StackFile::read(path)?;
     let name = path.display();
-    let sync = format!("`jj spr sync {name}`");
     let numbers = file
         .active(upto)?
         .into_iter()
@@ -128,8 +119,9 @@ async fn land_stack_file(
         .collect();
     if !merged.is_empty() {
         return Err(Error::new(format!(
-            "Not landing: {} merged already. Run {sync} first.",
-            format_or_nothing(&merged)
+            "Not landing: {} merged already. Run {} first.",
+            format_or_nothing(&merged),
+            spr_command("sync", Some(path))
         )));
     }
     match gh.stack_containing(top).await? {
@@ -149,15 +141,24 @@ async fn land_stack_file(
                 )));
             }
             output("#️⃣ ", &format!("Pull Request #{top}"))?;
-            land_pull_request(top, true, &sync, jj, gh, config).await
+            land_pull_request(top, true, Some(path), jj, gh, config).await
         }
         None => {
             for &number in &numbers {
                 output("#️⃣ ", &format!("Pull Request #{number}"))?;
-                land_pull_request(number, true, &sync, jj, gh, config).await?;
+                land_pull_request(number, true, Some(path), jj, gh, config).await?;
             }
             Ok(())
         }
+    }
+}
+
+/// `jj spr <command>` as the user runs it, with the stack file being landed
+/// if there is one, quoted for output.
+fn spr_command(command: &str, file: Option<&Path>) -> String {
+    match file {
+        Some(path) => format!("`jj spr {command} {}`", path.display()),
+        None => format!("`jj spr {command}`"),
     }
 }
 
@@ -170,12 +171,12 @@ fn format_or_nothing(numbers: &[u64]) -> String {
 }
 
 /// Land Pull Request `pull_request_number`, with every open Pull Request
-/// below it in its GitHub stack. `yes` merges those without asking. `sync`
-/// is the command to run afterwards.
+/// below it in its GitHub stack. `yes` merges those without asking. `file`
+/// is the stack file being landed, if any, for the commands `land` suggests.
 async fn land_pull_request(
     pull_request_number: u64,
     yes: bool,
-    sync: &str,
+    file: Option<&Path>,
     jj: &crate::jj::Jujutsu,
     gh: &mut crate::github::GitHub,
     config: &crate::config::Config,
@@ -289,17 +290,21 @@ async fn land_pull_request(
 
     // Merge bottom first, one Pull Request at a time, so each one gets its
     // own title and message (GitHub applies them only to the Pull Request
-    // named in the merge call). After each merge GitHub rebases the rest of
-    // the stack and retargets the next Pull Request to master, so only the
-    // first one still has the head fetched above.
+    // named in the merge call). After each merge GitHub retargets the next
+    // Pull Request to master and then replaces its head with a rebased one,
+    // so only the first one still has the head fetched above.
     let merging: Vec<&crate::github::PullRequest> =
         merged_below.iter().chain([&pull_request]).collect();
     let mut landed: Vec<&crate::github::PullRequest> = Vec::new();
     let mut merged_sha = None;
     let mut failure = None;
     for pr in merging.iter().copied() {
-        let expected_head = landed.is_empty().then_some(pr.head_oid);
-        let merged = match wait_until_mergeable(gh, pr.number, expected_head).await {
+        let head = if landed.is_empty() {
+            Head::Expected(pr.head_oid)
+        } else {
+            Head::Replaced(pr.head_oid)
+        };
+        let merged = match wait_until_mergeable(gh, config, pr.number, head, file).await {
             Ok(head) => squash_merge(gh, config, pr, head, stack.is_some()).await,
             Err(error) => Err(error),
         };
@@ -467,7 +472,10 @@ async fn land_pull_request(
         }
         output(
             "👉",
-            &format!("Run {sync} to abandon the landed changes and rebase the rest of the stack"),
+            &format!(
+                "Run {} to abandon the landed changes and rebase the rest of the stack",
+                spr_command("sync", file)
+            ),
         )?;
     }
 
@@ -509,13 +517,32 @@ fn mergeability_poll_interval() -> Duration {
         .map_or(Duration::from_secs(1), Duration::from_millis)
 }
 
-/// Wait until Pull Request `number` targets master and GitHub has worked out
-/// whether it can be merged, and refuse if it cannot. Returns its head, which
-/// must be `expected_head` when that is given.
+/// How many polls `land` waits for GitHub to replace a Pull Request's head
+/// after a merge below it, about 30 seconds. Until then GitHub may report
+/// whether the old head can be merged. GitHub pushes no new head when its
+/// rebase conflicts, so after this the old head's mergeability counts.
+const REBASE_POLLS: u32 = 30;
+
+/// A Pull Request's head as `land` fetched it before merging anything.
+#[derive(Clone, Copy)]
+enum Head {
+    /// The Pull Request must still have this head.
+    Expected(git2::Oid),
+    /// A Pull Request merged below it in this run, and GitHub replaces this
+    /// head with a rebased one.
+    Replaced(git2::Oid),
+}
+
+/// Wait until GitHub has worked out whether Pull Request `number` can be
+/// merged, and refuse if it cannot or GitHub blocks it. After a merge below
+/// it, that is once it targets master and has a new head, or `REBASE_POLLS`
+/// polls without one. Returns the head to merge.
 async fn wait_until_mergeable(
     gh: &crate::github::GitHub,
+    config: &crate::config::Config,
     number: u64,
-    expected_head: Option<git2::Oid>,
+    head: Head,
+    file: Option<&Path>,
 ) -> Result<git2::Oid> {
     for poll in 0..MERGEABILITY_POLLS {
         let mergeability = gh.get_pull_request_mergeability(number).await?;
@@ -528,19 +555,40 @@ async fn wait_until_mergeable(
                  `Pull Request:` line and run `jj spr diff` to open a new one."
             )));
         }
-        if expected_head.is_some_and(|head| head != mergeability.head_oid) {
-            return Err(Error::new(format!(
-                "Pull Request #{number} seems to have been updated externally. Please \
-                 try again!"
-            )));
-        }
-        if mergeability.base.is_master_branch()
-            && let Some(mergeable) = mergeability.mergeable
-        {
-            if !mergeable {
+        let settled = match head {
+            Head::Expected(expected) if expected != mergeability.head_oid => {
                 return Err(Error::new(format!(
-                    "GitHub concluded Pull Request #{number} is not mergeable at this \
-                     point. Please rebase your changes and try again!"
+                    "Pull Request #{number} seems to have been updated externally. \
+                     Please try again!"
+                )));
+            }
+            Head::Expected(_) => true,
+            Head::Replaced(old) => {
+                mergeability.base.is_master_branch()
+                    && (mergeability.head_oid != old || poll >= REBASE_POLLS)
+            }
+        };
+        if settled && let Some(mergeable) = mergeability.mergeable {
+            if !mergeable {
+                return Err(Error::new(match head {
+                    Head::Expected(_) => format!(
+                        "GitHub concluded Pull Request #{number} is not mergeable at \
+                         this point. Please rebase your changes and try again!"
+                    ),
+                    Head::Replaced(_) => format!(
+                        "Pull Request #{number} conflicts with {} after the merge below \
+                         it. Run {}, resolve the conflict, and run {} again.",
+                        config.master_ref.branch_name(),
+                        spr_command("sync", file),
+                        spr_command(if file.is_some() { "submit" } else { "diff" }, file),
+                    ),
+                }));
+            }
+            if mergeability.blocked {
+                return Err(Error::new(format!(
+                    "Pull Request #{number} can't be merged yet: GitHub is blocking it \
+                     (required checks or review). Run {} again when it is ready.",
+                    spr_command("land", file)
                 )));
             }
             return Ok(mergeability.head_oid);

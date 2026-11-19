@@ -788,6 +788,58 @@ fn land_gives_up_when_github_does_not_compute_mergeability() {
 }
 
 #[test]
+fn land_waits_for_github_to_rebase_after_a_merge_below() {
+    // B changes the line A adds. After A merges, GitHub points B at main
+    // and reports B's old head as conflicting with main until its rebase of
+    // B lands.
+    let env = TestEnv::new();
+    env.commit("Change A", "f.txt", "a\n");
+    let b = env.commit("Change B", "f.txt", "b\n");
+    env.spr(&["diff", "--all", "-m", "initial"]);
+    let main = env.branch("main").unwrap();
+    env.gh.state().stale_head_polls = 3;
+
+    env.spr(&["land", "-r", &b, "--yes"]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: f.txt", "Change B: f.txt"]
+    );
+    assert_eq!(env.remote_git(&["show", "main:f.txt"]), "b");
+}
+
+#[test]
+fn land_stops_at_a_pull_request_github_blocks() {
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    env.gh.state().blocked.push(prs[1]);
+
+    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
+    assert!(!out.success, "land should stop:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!(
+            "Landed #{}, but not #{}, #{}",
+            prs[0], prs[1], prs[2]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!(
+            "Pull Request #{} can't be merged yet: GitHub is blocking it",
+            prs[1]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(text.contains("Run `jj spr sync`"), "{}", out.text);
+    assert_eq!(env.landed_since(&main), vec!["Change A: a.txt"]);
+    assert!(env.branch(&env.pr(prs[0]).head_ref).is_none());
+}
+
+#[test]
 fn land_stops_at_a_pull_request_github_closed() {
     // A, B, C reordered to A, C, B and pushed the way older versions of
     // jj-spr did: C's branch, which has B's commit in it, gets a commit that
@@ -995,10 +1047,14 @@ fn land_after_resolving_a_conflict_with_the_change_below() {
         out.text
     );
     assert!(
-        text.contains(&format!("#{} is not mergeable", prs[1])),
+        text.contains(&format!(
+            "Pull Request #{} conflicts with main after the merge below it",
+            prs[1]
+        )),
         "{}",
         out.text
     );
+    assert!(!text.contains("rebase your changes"), "{}", out.text);
     assert!(
         env.requests_since(0, "PUT", &format!("pulls/{}/merge", prs[1]))
             .is_empty(),

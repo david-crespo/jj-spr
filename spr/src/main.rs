@@ -63,6 +63,10 @@ enum Commands {
     Format(commands::format::FormatOptions),
 
     /// Land a reviewed Pull Request
+    ///
+    /// In a GitHub stack, this merges the Pull Requests one at a time,
+    /// bottom first. `land` does not wait for CI. If GitHub blocks a merge
+    /// for required checks or reviews, it stops there.
     Land(commands::land::LandOptions),
 
     /// Update local commit message with content on GitHub

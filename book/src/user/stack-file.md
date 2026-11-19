@@ -100,6 +100,8 @@ Options:
 
 Lands the stack, or with `--upto <tip>`, the entries up to and including that one. It lands the Pull Requests one at a time, bottom first. Each one is squash-merged on its own, so each commit on the main branch has its Pull Request's title and body. In a GitHub stack, the Pull Requests below the highest one being landed have to match the file's entries below it.
 
+After each merge, `land` waits for GitHub to retarget and rebase the next Pull Request before it merges that one. It does not wait for CI. If GitHub blocks a Pull Request for required checks or reviews, `land` stops there, after landing the ones below it. Run `jj spr sync <path>`, then run `jj spr land <path>` again once GitHub allows the merge.
+
 ### `jj spr sync <path>`
 
 Cleans up after Pull Requests merge: it abandons the merged changes, rebases the rest onto the main branch, and marks the merged entries `merged`.
