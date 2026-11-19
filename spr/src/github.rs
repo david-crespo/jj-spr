@@ -212,6 +212,14 @@ pub struct OpenPullRequestBranchesQuery;
 )]
 pub struct PullRequestsForBranchQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "src/gql/schema.docs.graphql",
+    query_path = "src/gql/repository_squash_defaults.graphql",
+    response_derives = "Debug"
+)]
+pub struct RepositorySquashDefaultsQuery;
+
 impl GitHub {
     pub fn new(
         config: crate::config::Config,
@@ -553,6 +561,41 @@ impl GitHub {
         })
     }
 
+    /// Whether the repository's default squash commit for a Pull Request is
+    /// its title and body (the `PR_TITLE` and `PR_BODY` settings). False
+    /// when GitHub does not say, as for a token without access to them.
+    pub async fn squash_defaults_to_pull_request(&self) -> bool {
+        use repository_squash_defaults_query::{
+            ResponseData, SquashMergeCommitMessage, SquashMergeCommitTitle, Variables,
+        };
+        let request_body = RepositorySquashDefaultsQuery::build_query(Variables {
+            name: self.config.repo.clone(),
+            owner: self.config.owner.clone(),
+        });
+        let response: reqwest::Result<Response<ResponseData>> = async {
+            self.graphql_client
+                .post(self.config.graphql_url())
+                .json(&request_body)
+                .send()
+                .await?
+                .json()
+                .await
+        }
+        .await;
+        response
+            .ok()
+            .and_then(|response| response.data?.repository)
+            .is_some_and(|repository| {
+                matches!(
+                    repository.squash_merge_commit_title,
+                    SquashMergeCommitTitle::PR_TITLE
+                ) && matches!(
+                    repository.squash_merge_commit_message,
+                    SquashMergeCommitMessage::PR_BODY
+                )
+            })
+    }
+
     /// The CI checks on a Pull Request's head and its unresolved review
     /// threads.
     pub async fn get_pull_request_status(&self, number: u64) -> Result<PullRequestStatus> {
@@ -887,32 +930,31 @@ impl GitHub {
     /// Merge a Pull Request that is part of a native stack. GitHub only
     /// accepts merges of stacked Pull Requests through its asynchronous merge
     /// endpoint; this submits the merge and waits for it to finish. GitHub
-    /// also merges the open Pull Requests below this one, and the commit
-    /// title and message apply only to this one's commit.
+    /// also merges the open Pull Requests below this one. `commit` is the
+    /// title and message for this one's commit only; without it, and for
+    /// the ones below, GitHub uses the repository's default.
     pub async fn merge_stacked_pull_request(
         &self,
         number: u64,
         expected_head: git2::Oid,
         merge_method: &str,
-        commit_title: &str,
-        commit_message: &str,
+        commit: Option<(&str, &str)>,
     ) -> Result<Option<String>> {
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge-async",
             self.config.owner, self.config.repo, number
         );
+        let mut body = serde_json::json!({
+            "merge_action": "direct_merge",
+            "merge_method": merge_method,
+            "sha": expected_head.to_string(),
+        });
+        if let Some((title, message)) = commit {
+            body["commit_title"] = title.into();
+            body["commit_message"] = message.into();
+        }
         let (status, json) = self
-            .rest_request(
-                reqwest::Method::PUT,
-                &path,
-                Some(serde_json::json!({
-                    "merge_action": "direct_merge",
-                    "merge_method": merge_method,
-                    "sha": expected_head.to_string(),
-                    "commit_title": commit_title,
-                    "commit_message": commit_message,
-                })),
-            )
+            .rest_request(reqwest::Method::PUT, &path, Some(body))
             .await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(Error::new(format!(

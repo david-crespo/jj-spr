@@ -119,10 +119,13 @@ jj spr land <file> --upto <tip>
 jj spr sync <file>
 ```
 
-`land` squash-merges the PRs one at a time, bottom first, so each commit on
-the main branch has its PR's title and body. Without `--upto` it lands the
-whole stack. Give it a long timeout: after each merge, GitHub can take a
-minute to work out whether the next PR can merge, and `land` waits. It does
+Without `--upto`, `land` lands the whole stack. When the repository's
+default commit message for squash merges is the PR title and description,
+`land` lands a GitHub stack in one merge. Each commit on the main branch has
+its PR's title, number, and body. Otherwise it squash-merges the PRs one at a
+time, bottom first, so each commit on the main branch has its PR's title and
+body. Give it a long timeout: one at a time, GitHub can take a minute after
+each merge to rebase the rest of the stack, and `land` waits for that. It does
 not wait for CI. If GitHub blocks a PR for required checks or reviews,
 `land` stops there with an error. If any PRs landed, run `sync`. Tell the
 user which PR is blocked, and run `land` again once they say the checks or

@@ -145,6 +145,11 @@ pub struct State {
     /// Pull Requests whose merge GitHub blocks (for required checks or
     /// reviews) although they have no conflicts.
     pub blocked: Vec<u64>,
+    /// The repository's `squashMergeCommitTitle` and
+    /// `squashMergeCommitMessage` settings. With `PR_BODY`, a squash merge
+    /// without a requested message gets the Pull Request's body.
+    pub squash_merge_commit_title: String,
+    pub squash_merge_commit_message: String,
     /// Head branches whose next Pull Request GitHub refuses to create, once.
     pub failing_creations: Vec<String>,
     pub requests: Vec<Recorded>,
@@ -681,31 +686,40 @@ impl State {
     // -- merging -----------------------------------------------------------
 
     fn squash_merge(&mut self, number: u64, commit: Option<(String, String)>) -> Option<String> {
-        self.squash_merge_from(number, None, commit)
+        let base_ref = self.prs[&number].base_ref.clone();
+        self.squash_merge_from(number, &base_ref, None, commit)
     }
 
-    /// Squash-merge `number` into its base; `None`, with nothing changed,
-    /// when that conflicts. `merge_base` is where its own changes start,
-    /// when that is not the merge base with the base branch (a stacked PR
-    /// whose parent was just squash-merged below it). `commit` is the
-    /// requested title and message; without it the message is the fake's
-    /// own default.
+    /// Squash-merge `number` onto branch `base_ref`; `None`, with nothing
+    /// changed, when that conflicts. `merge_base` is where its own changes
+    /// start, when that is not the merge base with the base branch (a
+    /// stacked PR whose parent was just squash-merged below it). `commit` is
+    /// the requested title and message. Without it, the title is the Pull
+    /// Request's with its number, and the message is its body under the
+    /// `PR_BODY` setting and empty otherwise (where GitHub would list the
+    /// commits).
     fn squash_merge_from(
         &mut self,
         number: u64,
+        base_ref: &str,
         merge_base: Option<&str>,
         commit: Option<(String, String)>,
     ) -> Option<String> {
         let heads = self.branches();
-        let (base_ref, head_ref, title) = {
-            let pr = &self.prs[&number];
-            (pr.base_ref.clone(), pr.head_ref.clone(), pr.title.clone())
-        };
-        let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
-        let message = match commit {
-            Some((title, body)) if body.is_empty() => title,
-            Some((title, body)) => format!("{title}\n\n{body}"),
-            None => format!("{title} (#{number})"),
+        let pr = &self.prs[&number];
+        let head_ref = pr.head_ref.clone();
+        let (base, head) = (heads[base_ref].clone(), heads[&head_ref].clone());
+        let (title, body) = commit.unwrap_or_else(|| {
+            let body = match self.squash_merge_commit_message.as_str() {
+                "PR_BODY" => pr.body.clone(),
+                _ => String::new(),
+            };
+            (format!("{} (#{number})", pr.title), body)
+        });
+        let message = if body.is_empty() {
+            title
+        } else {
+            format!("{title}\n\n{body}")
         };
         let tree = self.merged_tree(merge_base, &base, &head)?;
         let commit = self.commit_tree(&tree, &[&base], &message, None);
@@ -787,18 +801,15 @@ impl State {
         let old_top = self.branches()[&self.prs[&prefix[cut - 1]].head_ref].clone();
         let mut below: Option<String> = None;
         let commit = self.merge_ops[&pr_number].commit.clone();
+        // Every Pull Request of the prefix keeps its base branch, as on
+        // GitHub, though each lands on the stack's base.
         for number in &prefix {
             let head = self.branches()[&self.prs[number].head_ref].clone();
-            let old_base = std::mem::replace(
-                &mut self.prs.get_mut(number).unwrap().base_ref,
-                base_ref.clone(),
-            );
             let commit = commit.clone().filter(|_| *number == pr_number);
             if self
-                .squash_merge_from(*number, below.as_deref(), commit)
+                .squash_merge_from(*number, &base_ref, below.as_deref(), commit)
                 .is_none()
             {
-                self.prs.get_mut(number).unwrap().base_ref = old_base;
                 let op = self.merge_ops.get_mut(&pr_number).unwrap();
                 op.status = "failed".into();
                 op.message = format!("Pull request #{number} is not mergeable.");
@@ -1234,6 +1245,10 @@ impl State {
                 }
                 json!({"data": {"repository": {"pullRequest": data}}})
             }
+            "RepositorySquashDefaultsQuery" => json!({"data": {"repository": {
+                "squashMergeCommitTitle": self.squash_merge_commit_title,
+                "squashMergeCommitMessage": self.squash_merge_commit_message,
+            }}}),
             "PullRequestStatusQuery" => {
                 let data = variables["number"]
                     .as_u64()
@@ -1358,6 +1373,8 @@ impl FakeGitHub {
             stale_head_polls: 0,
             held_rebase: None,
             blocked: Vec::new(),
+            squash_merge_commit_title: "COMMIT_OR_PR_TITLE".into(),
+            squash_merge_commit_message: "COMMIT_MESSAGES".into(),
             failing_creations: Vec::new(),
             requests: Vec::new(),
             next_number: 1,

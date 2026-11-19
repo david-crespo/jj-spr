@@ -98,9 +98,11 @@ Options:
 
 ### `jj spr land <path>`
 
-Lands the stack, or with `--upto <tip>`, the entries up to and including that one. It lands the Pull Requests one at a time, bottom first. Each one is squash-merged on its own, so each commit on the main branch has its Pull Request's title and body. In a GitHub stack, the Pull Requests below the highest one being landed have to match the file's entries below it.
+Lands the stack, or with `--upto <tip>`, the entries up to and including that one. In a GitHub stack, the Pull Requests below the highest one being landed have to match the file's entries below it.
 
-After each merge, `land` waits for GitHub to retarget and rebase the next Pull Request before it merges that one. It does not wait for CI. If GitHub blocks a Pull Request for required checks or reviews, `land` stops there, after landing the ones below it. Run `jj spr sync <path>`, then run `jj spr land <path>` again once GitHub allows the merge.
+How `land` merges a GitHub stack depends on the repository's default commit message for squash merges. When the default is the Pull Request title and description, `land` makes one merge of the highest Pull Request being landed. GitHub merges any below it in the same operation. Each commit on the main branch has its Pull Request's title, followed by its number, and its body. With any other default (or if jj-spr can't read it), or without a GitHub stack, `land` merges the Pull Requests one at a time, bottom first, so each commit on the main branch has its Pull Request's title and body. After each merge in a GitHub stack, `land` waits for GitHub to retarget and rebase the next Pull Request before it merges that one.
+
+`land` does not wait for CI. If GitHub blocks a Pull Request for required checks or reviews, `land` stops there. Pull Requests below it that already merged stay merged. Run `jj spr sync <path>`, then run `jj spr land <path>` again once GitHub allows the merge.
 
 ### `jj spr sync <path>`
 

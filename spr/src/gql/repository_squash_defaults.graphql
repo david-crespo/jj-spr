@@ -1,0 +1,6 @@
+query RepositorySquashDefaultsQuery($name: String!, $owner: String!) {
+  repository(owner: $owner, name: $name) {
+    squashMergeCommitTitle
+    squashMergeCommitMessage
+  }
+}

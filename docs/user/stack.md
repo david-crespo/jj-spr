@@ -138,14 +138,24 @@ which GitHub shows as one unit in its UI.
   every PR below it, after listing them and asking (pass `--yes` to skip the
   question, which is required outside a terminal). Every PR that would merge
   is checked first: none may be a draft, and each must be approved if
-  `spr.requireApproval` is set. `land` merges the PRs one at a time, bottom
-  first. After each merge, GitHub retargets the next PR to the main branch and
-  rebases the rest of the stack. `land` waits for that rebase before it
-  merges the next PR. Afterwards, run `jj spr sync` and then
-  `jj spr diff --all`. `land` does not wait for CI. If GitHub blocks a PR for
-  required checks or reviews, `land` stops there and prints which PRs landed.
-  Run `jj spr sync`, then run `jj spr land` again once GitHub allows the
-  merge.
+  `spr.requireApproval` is set. How `land` merges depends on the repository's
+  default commit message for squash merges:
+  - When the default is the pull request title and description (`PR_TITLE`
+    and `PR_BODY` in GitHub's API), `land` makes one merge of the highest PR
+    being landed. GitHub merges any PRs below it in the same operation, with
+    no rebase in between. Each commit on the main branch has its PR's title,
+    followed by its number, and its description.
+  - With any other default, or if jj-spr can't read it, `land` merges the PRs
+    one at a time, bottom first, so each commit gets jj-spr's title and
+    message. After each merge, GitHub retargets the next PR to the main branch
+    and rebases the rest of the stack. `land` waits for that rebase before it
+    merges the next PR. When it merges more than one PR this way, `land`
+    prints a hint about changing the default.
+
+  Afterwards, run `jj spr sync` and then `jj spr diff --all`. `land` does not
+  wait for CI. If GitHub blocks a PR for required checks or reviews, `land`
+  stops there and prints which PRs landed. Run `jj spr sync`, then run
+  `jj spr land` again once GitHub allows the merge.
 - If stacked pull requests are not enabled for the repository, the PRs still
   target each other; they just aren't registered as a GitHub stack.
 
@@ -158,8 +168,7 @@ Until then, `jj spr land` refuses to land it. Once no open PR uses the old base
 branches, `jj spr cleanup --confirm` deletes them from GitHub.
 
 Limitations: repositories that merge through a merge queue are not supported
-yet, and a PR landed from a stack gets GitHub's default squash-commit message
-rather than one built from the PR description.
+yet.
 
 ## Understanding Your Stack
 

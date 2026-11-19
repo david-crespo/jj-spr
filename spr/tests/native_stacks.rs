@@ -400,7 +400,7 @@ fn land_top_gives_every_pull_request_its_message() {
     let prs = env.prs_for(&changes);
     let main = env.branch("main").unwrap();
 
-    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    let out = env.spr(&["land", "-r", &changes[2], "--yes"]);
     assert_eq!(
         messages_on_main_since(&env, &main),
         vec![
@@ -408,6 +408,152 @@ fn land_top_gives_every_pull_request_its_message() {
             landed_message(prs[1], "Change B"),
             landed_message(prs[2], "Change C"),
         ]
+    );
+    assert!(
+        out.flat().contains(PULL_REQUEST_DEFAULTS_HINT),
+        "{}",
+        out.text
+    );
+}
+
+const PULL_REQUEST_DEFAULTS_HINT: &str = "Setting the repository's default squash commit message \
+     to the Pull Request title and description lets jj-spr land a stack in one merge.";
+
+/// Set the repository's squash defaults to the Pull Request's title and
+/// body, and build a stack of changes with a body each.
+fn stack_with_pull_request_defaults(env: &TestEnv, names: &[&str]) -> Vec<String> {
+    {
+        let mut state = env.gh.state();
+        state.squash_merge_commit_title = "PR_TITLE".into();
+        state.squash_merge_commit_message = "PR_BODY".into();
+    }
+    let changes = names
+        .iter()
+        .map(|n| {
+            let title = format!("Change {}\n\nWhat {n} does.", n.to_uppercase());
+            env.commit(&title, &format!("{n}.txt"), &format!("{n}\n"))
+        })
+        .collect();
+    env.spr(&["diff", "--all", "-m", "initial"]);
+    changes
+}
+
+/// GitHub's default squash message under `PR_TITLE` and `PR_BODY`.
+fn default_message(env: &TestEnv, number: u64) -> String {
+    let pr = env.pr(number);
+    assert!(pr.body.contains(" does."), "{}", pr.body);
+    format!("{} (#{number})\n\n{}", pr.title, pr.body.trim())
+}
+
+#[test]
+fn land_a_stack_in_one_merge_with_pull_request_defaults() {
+    let env = TestEnv::new();
+    let changes = stack_with_pull_request_defaults(&env, &["a", "b", "c", "d"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    let bases: Vec<String> = prs.iter().map(|&n| env.pr(n).base_ref).collect();
+    let branches: Vec<String> = prs[..3].iter().map(|&n| env.pr(n).head_ref).collect();
+
+    let out = env.spr(&["land", "-r", &changes[2], "--yes"]);
+    let merges = env.gh.state().requests.clone();
+    let merges: Vec<_> = merges
+        .iter()
+        .filter(|r| r.method == "PUT" && r.path.ends_with("merge-async"))
+        .collect();
+    assert_eq!(merges.len(), 1, "one merge for the stack");
+    assert!(
+        merges[0]
+            .path
+            .ends_with(&format!("pulls/{}/merge-async", prs[2]))
+    );
+    assert!(merges[0].body.get("commit_title").is_none());
+    assert!(merges[0].body.get("commit_message").is_none());
+    assert_eq!(
+        messages_on_main_since(&env, &main),
+        prs[..3]
+            .iter()
+            .map(|&n| default_message(&env, n))
+            .collect::<Vec<_>>()
+    );
+    let text = out.flat();
+    assert!(
+        text.contains(&format!("Landed #{}, #{}, #{}", prs[0], prs[1], prs[2])),
+        "{}",
+        out.text
+    );
+    assert!(!text.contains("Waiting for GitHub"), "{}", out.text);
+    assert!(!text.contains(PULL_REQUEST_DEFAULTS_HINT), "{}", out.text);
+    // GitHub merges the ones below without retargeting them.
+    assert_eq!(env.pr(prs[1]).base_ref, bases[1]);
+    assert_eq!(env.pr(prs[2]).base_ref, bases[2]);
+    for branch in &branches {
+        assert!(env.branch(branch).is_none(), "{branch} should be deleted");
+    }
+    let top = env.pr(prs[3]);
+    assert!(
+        top.is_open(),
+        "#{} was closed: {:?}",
+        prs[3],
+        top.closed_reason
+    );
+    assert_eq!(top.base_ref, "main");
+
+    env.spr(&["sync"]);
+    assert!(changes[..3].iter().all(|c| !env.is_visible(c)));
+    env.spr(&["diff", "--all", "-m", "after landing"]);
+    assert_eq!(env.pr_files(prs[3]), vec!["d.txt"]);
+}
+
+#[test]
+fn land_the_bottom_alone_with_pull_request_defaults() {
+    let env = TestEnv::new();
+    let changes = stack_with_pull_request_defaults(&env, &["a", "b"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+
+    env.spr(&["land", "-r", &changes[0]]);
+    let state = env.gh.state();
+    let merge = state
+        .requests
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.ends_with("merge-async"))
+        .expect("a stack merge");
+    assert!(merge.body.get("commit_title").is_none(), "{:?}", merge.body);
+    drop(state);
+    assert_eq!(
+        messages_on_main_since(&env, &main),
+        vec![default_message(&env, prs[0])]
+    );
+    assert!(env.pr(prs[1]).is_open());
+    assert_eq!(env.pr(prs[1]).base_ref, "main");
+}
+
+#[test]
+fn land_one_at_a_time_when_the_squash_defaults_cannot_be_read() {
+    let env = TestEnv::new();
+    let changes = stack_with_pull_request_defaults(&env, &["a", "b"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    env.gh
+        .state()
+        .failing_queries
+        .push("RepositorySquashDefaultsQuery".into());
+
+    let out = env.spr(&["land", "-r", &changes[1], "--yes"]);
+    assert!(
+        out.flat().contains(PULL_REQUEST_DEFAULTS_HINT),
+        "{}",
+        out.text
+    );
+    assert_eq!(env.requests_since(0, "PUT", "merge-async").len(), 2);
+    let messages = messages_on_main_since(&env, &main);
+    assert!(
+        messages[0].starts_with("Change A\n\nWhat a does."),
+        "{messages:?}"
+    );
+    assert!(
+        messages[1].ends_with(&format!("pull/{}", prs[1])),
+        "{messages:?}"
     );
 }
 

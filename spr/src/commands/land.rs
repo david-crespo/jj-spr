@@ -162,6 +162,10 @@ fn spr_command(command: &str, file: Option<&Path>) -> String {
     }
 }
 
+fn pr_numbers(prs: &[&crate::github::PullRequest]) -> String {
+    crate::stacks::format_pr_list(&prs.iter().map(|pr| pr.number).collect::<Vec<_>>())
+}
+
 fn format_or_nothing(numbers: &[u64]) -> String {
     if numbers.is_empty() {
         "nothing".to_string()
@@ -288,32 +292,52 @@ async fn land_pull_request(
         }
     }
 
-    // Merge bottom first, one Pull Request at a time, so each one gets its
-    // own title and message (GitHub applies them only to the Pull Request
-    // named in the merge call). After each merge GitHub retargets the next
-    // Pull Request to master and then replaces its head with a rebased one,
-    // so only the first one still has the head fetched above.
+    // When the repository's default squash commit for a Pull Request is its
+    // title and body, one merge of the top one lands the stack: GitHub
+    // squash-merges each Pull Request below it with that default, with no
+    // rebase in between. Otherwise merge bottom first, one Pull Request at a
+    // time, so each one gets jj-spr's title and message (GitHub applies them
+    // only to the Pull Request named in the merge call). After each merge
+    // GitHub retargets the next Pull Request to master and then replaces its
+    // head with a rebased one, so only the first one still has the head
+    // fetched above.
     let merging: Vec<&crate::github::PullRequest> =
         merged_below.iter().chain([&pull_request]).collect();
+    let one_merge = stack.is_some() && gh.squash_defaults_to_pull_request().await;
+    if stack.is_some() && !one_merge && merging.len() > 1 {
+        output(
+            "💡",
+            "Setting the repository's default squash commit message to the Pull \
+             Request title and description lets jj-spr land a stack in one merge.",
+        )?;
+    }
+    let first = if one_merge { merging.len() - 1 } else { 0 };
     let mut landed: Vec<&crate::github::PullRequest> = Vec::new();
     let mut merged_sha = None;
     let mut failure = None;
-    for pr in merging.iter().copied() {
+    for (i, pr) in merging.iter().copied().enumerate().skip(first) {
         let head = if landed.is_empty() {
             Head::Expected(pr.head_oid)
         } else {
             Head::Replaced(pr.head_oid)
         };
-        let merged = match wait_until_mergeable(gh, config, pr.number, head, file).await {
-            Ok(head) => squash_merge(gh, config, pr, head, stack.is_some()).await,
-            Err(error) => Err(error),
+        // One merge of a stack goes straight to GitHub, which checks the head
+        // and every Pull Request in the merge, and says why if it refuses.
+        let merged = if one_merge {
+            squash_merge(gh, config, pr, pr.head_oid, true, false).await
+        } else {
+            match wait_until_mergeable(gh, config, pr.number, head, file).await {
+                Ok(head) => squash_merge(gh, config, pr, head, stack.is_some(), true).await,
+                Err(error) => Err(error),
+            }
         };
         match merged {
             Ok(sha) => {
+                let merged = &merging[landed.len()..=i];
                 if merging.len() > 1 {
-                    output("🛬", &format!("Landed #{}", pr.number))?;
+                    output("🛬", &format!("Landed {}", pr_numbers(merged)))?;
                 }
-                landed.push(pr);
+                landed.extend_from_slice(merged);
                 merged_sha = sha;
             }
             Err(error) => {
@@ -331,15 +355,12 @@ async fn land_pull_request(
         // Each landed Pull Request is a complete commit on master, so clean
         // up after those and report the rest.
         Some(error) => {
-            let numbers = |prs: &[&crate::github::PullRequest]| {
-                crate::stacks::format_pr_list(&prs.iter().map(|pr| pr.number).collect::<Vec<_>>())
-            };
             output(
                 "❌",
                 &format!(
                     "Landed {}, but not {}",
-                    numbers(&landed),
-                    numbers(&merging[landed.len()..])
+                    pr_numbers(&landed),
+                    pr_numbers(&merging[landed.len()..])
                 ),
             )?;
             Some(error)
@@ -607,19 +628,22 @@ async fn wait_until_mergeable(
     )))
 }
 
-/// Squash-merge `pull_request` at `head` with jj-spr's title and message.
-/// A Pull Request in a native stack has to go through GitHub's stack merge.
+/// Squash-merge `pull_request` at `head`, with jj-spr's title and message
+/// when `own_message` is set and GitHub's default otherwise. A Pull Request
+/// in a native stack has to go through GitHub's stack merge.
 async fn squash_merge(
     gh: &crate::github::GitHub,
     config: &crate::config::Config,
     pull_request: &crate::github::PullRequest,
     head: git2::Oid,
     stacked: bool,
+    own_message: bool,
 ) -> Result<Option<String>> {
     let number = pull_request.number;
     let message = build_github_body_for_merging(&pull_request.sections);
     let merged = if stacked {
-        gh.merge_stacked_pull_request(number, head, "squash", &pull_request.title, &message)
+        let commit = own_message.then_some((pull_request.title.as_str(), message.as_str()));
+        gh.merge_stacked_pull_request(number, head, "squash", commit)
             .await
     } else {
         octocrab::instance()

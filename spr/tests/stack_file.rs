@@ -1240,6 +1240,46 @@ fn land_and_sync_a_whole_stack() {
 }
 
 #[test]
+fn land_a_stack_file_in_one_merge_with_pull_request_defaults() {
+    let env = TestEnv::new();
+    let (stack, groups, prs) = submitted(&env);
+    let main = env.branch("main").unwrap();
+    {
+        let mut state = env.gh.state();
+        state.squash_merge_commit_title = "PR_TITLE".into();
+        state.squash_merge_commit_message = "PR_BODY".into();
+    }
+
+    stack.spr("land", &[]);
+    assert_eq!(env.requests_since(0, "PUT", "merge-async").len(), 1);
+    let commits = main_commits(&env, &main);
+    let subjects: Vec<&str> = commits.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec![
+            format!("Title of A (#{})", prs[0]),
+            format!("Title of B (#{})", prs[1]),
+            format!("Title of C (#{})", prs[2]),
+        ]
+    );
+    assert_eq!(commits[1].1.trim(), env.pr(prs[1]).body.trim());
+    assert!(
+        commits[1]
+            .1
+            .starts_with("What B does.\n\nIn two paragraphs."),
+        "{commits:?}"
+    );
+
+    stack.spr("sync", &[]);
+    for change in groups.iter().flatten() {
+        assert!(!env.is_visible(change), "{change} should be abandoned");
+    }
+    for i in 0..3 {
+        assert_eq!(stack.entry(i)["merged"], true, "{}", stack.entry(i));
+    }
+}
+
+#[test]
 fn land_upto_then_sync_and_submit_the_rest() {
     let env = TestEnv::new();
     let (stack, groups, prs) = submitted(&env);
