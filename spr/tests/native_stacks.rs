@@ -429,36 +429,6 @@ fn land_top_gives_every_pull_request_its_message() {
 }
 
 #[test]
-fn land_reports_which_pull_requests_landed_when_one_fails() {
-    let env = TestEnv::new();
-    let changes = env.build_stack(&["a", "b", "c"]);
-    let prs = env.prs_for(&changes);
-    let merged_branch = env.pr(prs[0]).head_ref;
-    env.gh.state().conflicting.push(prs[1]);
-
-    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
-    assert!(!out.success, "land should fail:\n{}", out.text);
-    let text = out.flat();
-    assert!(
-        text.contains(&format!(
-            "Landed #{}, but not #{}, #{}",
-            prs[0], prs[1], prs[2]
-        )),
-        "{}",
-        out.text
-    );
-    assert!(text.contains("not mergeable"), "{}", out.text);
-    assert!(env.pr(prs[0]).merged_at.is_some(), "A should be merged");
-    for &n in &prs[1..] {
-        assert!(env.pr(n).is_open(), "PR #{n} should still be open");
-    }
-    assert!(
-        env.branch(&merged_branch).is_none(),
-        "the landed branch should be deleted"
-    );
-}
-
-#[test]
 fn land_middle_needs_confirmation() {
     let env = TestEnv::new();
     let changes = env.build_stack(&["a", "b", "c"]);
@@ -910,4 +880,77 @@ fn diff_refuses_until_merged_changes_are_synced() {
     env.spr(&["sync"]);
     env.spr(&["diff", "--all", "-m", "after sync"]);
     env.check_chain(&changes[1..]);
+}
+
+#[test]
+fn land_after_resolving_a_conflict_with_the_change_below() {
+    // A changes line 1 of f.txt, B line 3, and C line 5. A is then amended
+    // to change line 3 too, and the conflict in B resolved. After A merges,
+    // GitHub cannot replay B onto main, so it rebases nothing, and B's Pull
+    // Request conflicts with main until sync and diff merge main into it.
+    let env = TestEnv::new();
+    env.push_to_main("f.txt", "1\n2\n3\n4\n5\n");
+    env.jj(&["git", "fetch"]);
+    env.jj(&["new", "main@origin"]);
+    let changes = vec![
+        env.commit("Change A", "f.txt", "1 A\n2\n3\n4\n5\n"),
+        env.commit("Change B", "f.txt", "1 A\n2\n3 B\n4\n5\n"),
+        env.commit("Change C", "f.txt", "1 A\n2\n3 B\n4\n5 C\n"),
+    ];
+    env.spr(&["diff", "--all", "-m", "initial"]);
+    let prs = env.prs_for(&changes);
+    let main = env.branch("main").unwrap();
+    env.jj(&["edit", &changes[0]]);
+    std::fs::write(env.work.join("f.txt"), "1 A\n2\n3 A\n4\n5\n").unwrap();
+    env.jj(&["edit", &changes[1]]);
+    std::fs::write(env.work.join("f.txt"), "1 A\n2\n3 A+B\n4\n5\n").unwrap();
+    env.jj(&["new", &changes[2]]);
+    env.spr(&["diff", "--all", "-m", "amend A, resolve B"]);
+    env.check_chain(&changes);
+    let heads: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    let a_branch = env.pr(prs[0]).head_ref;
+
+    let out = env.try_spr(&["land", "-r", &changes[2], "--yes"]);
+    assert!(!out.success, "land should stop after A:\n{}", out.text);
+    let text = out.flat();
+    assert!(
+        text.contains(&format!(
+            "Landed #{}, but not #{}, #{}",
+            prs[0], prs[1], prs[2]
+        )),
+        "{}",
+        out.text
+    );
+    assert!(
+        text.contains(&format!("#{} is not mergeable", prs[1])),
+        "{}",
+        out.text
+    );
+    assert!(
+        env.requests_since(0, "PUT", &format!("pulls/{}/merge", prs[1]))
+            .is_empty(),
+        "land should not ask GitHub to merge a conflicting Pull Request"
+    );
+    assert!(env.pr(prs[0]).merged_at.is_some(), "A should be merged");
+    assert!(
+        env.branch(&a_branch).is_none(),
+        "the landed branch should be deleted"
+    );
+    let after: Vec<String> = prs[1..].iter().map(|&n| env.head_of(n)).collect();
+    assert_eq!(after, heads, "GitHub rebases nothing when B conflicts");
+    assert_eq!(env.pr(prs[1]).base_ref, "main");
+    assert_eq!(env.pr(prs[2]).base_ref, env.pr(prs[1]).head_ref);
+
+    env.spr(&["sync"]);
+    env.spr(&["diff", "--all", "-m", "after sync"]);
+    env.check_chain(&changes[1..]);
+    env.spr(&["land", "-r", &changes[2], "--yes"]);
+    assert_eq!(
+        env.landed_since(&main),
+        vec!["Change A: f.txt", "Change B: f.txt", "Change C: f.txt"]
+    );
+    assert_eq!(
+        env.remote_git(&["show", "main:f.txt"]),
+        "1 A\n2\n3 A+B\n4\n5 C"
+    );
 }

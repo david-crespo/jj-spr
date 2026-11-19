@@ -351,6 +351,22 @@ impl TestEnv {
         files
     }
 
+    /// Each commit on main after `since`, oldest first, as its subject and
+    /// the files it changes: "Change A: a.txt".
+    pub fn landed_since(&self, since: &str) -> Vec<String> {
+        self.remote_git(&[
+            "log",
+            "--reverse",
+            "--format=%x00%s:",
+            "--name-only",
+            &format!("{since}..main"),
+        ])
+        .split('\0')
+        .map(|commit| commit.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|commit| !commit.is_empty())
+        .collect()
+    }
+
     pub fn stacks(&self) -> BTreeMap<u64, Vec<u64>> {
         self.gh.state().stacks.clone()
     }

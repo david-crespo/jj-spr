@@ -22,8 +22,12 @@
 //!   "update branch" (403)
 //! - after a stacked merge, GitHub rewrites the branches of the remaining
 //!   members: it replays each of their commits onto the new base, keeping
-//!   message and author, and drops merge commits. A member with no commits
-//!   left to replay is reset to its new base's head and closed.
+//!   message and author, and drops merge commits and commits that the new
+//!   base makes empty. A member with no commits left to replay is reset to
+//!   its new base's head and closed.
+//! - when replaying a member's commits would conflict, GitHub rewrites no
+//!   branch at all. It still points the Pull Request above the merged ones
+//!   at the stack's base, and reports that Pull Request as `CONFLICTING`.
 //! - a draft cannot be merged: 405 from the ordinary endpoint, and a failed
 //!   merge (400) from `merge-async`
 //! - a PR in the middle of a stack can be closed; the stack still lists it
@@ -126,8 +130,6 @@ pub struct State {
     /// How many more mergeability queries answer `UNKNOWN`, as GitHub does
     /// while it is still computing mergeability.
     pub unknown_mergeability_polls: u32,
-    /// Pull Requests that GitHub reports as `CONFLICTING`.
-    pub conflicting: Vec<u64>,
     pub requests: Vec<Recorded>,
     /// Pull requests and stacks share one sequence of numbers, as on GitHub.
     next_number: u64,
@@ -136,12 +138,15 @@ pub struct State {
 struct ApiError {
     status: u16,
     message: String,
+    /// The `errors` of a 422 "Validation Failed" reply.
+    errors: Vec<Value>,
 }
 
 fn api_error<T>(status: u16, message: impl Into<String>) -> Result<T, ApiError> {
     Err(ApiError {
         status,
         message: message.into(),
+        errors: Vec::new(),
     })
 }
 
@@ -214,25 +219,43 @@ impl State {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    /// `merge-tree --write-tree` (optionally with a merge base) followed by
-    /// `commit-tree`: the merged tree committed onto `parents`.
-    fn merge_tree_commit(
+    /// `merge-tree --write-tree`, optionally with a merge base: the merged
+    /// tree, or `None` when the merge conflicts.
+    fn merged_tree(&self, merge_base: Option<&str>, ours: &str, theirs: &str) -> Option<String> {
+        let mut command = Command::new("git");
+        command
+            .arg("--git-dir")
+            .arg(&self.git_dir)
+            .args(["merge-tree", "--write-tree"]);
+        if let Some(merge_base) = merge_base {
+            command.arg(format!("--merge-base={merge_base}"));
+        }
+        let output = command
+            .args([ours, theirs])
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run git");
+        match output.status.code() {
+            Some(0) => {
+                let tree = String::from_utf8_lossy(&output.stdout);
+                Some(tree.lines().next().unwrap().to_string())
+            }
+            Some(1) => None,
+            _ => panic!(
+                "fake github: git merge-tree {ours} {theirs} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        }
+    }
+
+    /// Commit `tree` onto `parents`, with the author of `author_of` if given.
+    fn commit_tree(
         &self,
-        merge_base: Option<&str>,
-        ours: &str,
-        theirs: &str,
+        tree: &str,
         parents: &[&str],
         message: &str,
         author_of: Option<&str>,
     ) -> String {
-        let mut merge = vec!["merge-tree".to_string(), "--write-tree".to_string()];
-        if let Some(merge_base) = merge_base {
-            merge.push(format!("--merge-base={merge_base}"));
-        }
-        merge.extend([ours.to_string(), theirs.to_string()]);
-        let merge: Vec<&str> = merge.iter().map(String::as_str).collect();
-        let tree = self.git(&merge);
-        let tree = tree.lines().next().unwrap();
         let mut commit = vec!["commit-tree", tree];
         for parent in parents {
             commit.extend(["-p", parent]);
@@ -242,6 +265,10 @@ impl State {
             Some(original) => self.git_as_author_of(original, &commit),
             None => self.git(&commit),
         }
+    }
+
+    fn tree_of(&self, commit: &str) -> String {
+        self.git(&["rev-parse", &format!("{commit}^{{tree}}")])
     }
 
     pub fn branches(&self) -> BTreeMap<String, String> {
@@ -458,11 +485,23 @@ impl State {
             "baseRefName": pr.base_ref,
             "headRefName": pr.head_ref,
             "headRefOid": self.branches().get(&pr.head_ref).unwrap_or(&pr.last_head_sha),
-            "mergeable": if self.conflicting.contains(&number) { "CONFLICTING" } else { "MERGEABLE" },
+            "mergeable": if self.is_conflicting(number) { "CONFLICTING" } else { "MERGEABLE" },
             "mergeCommit": pr.merge_commit_sha.as_ref().map(|oid| json!({"oid": oid})),
             "latestOpinionatedReviews": {"nodes": reviews},
             "reviewRequests": {"nodes": []},
         })
+    }
+
+    /// Whether merging the Pull Request's head into its base conflicts.
+    fn is_conflicting(&self, number: u64) -> bool {
+        let pr = &self.prs[&number];
+        let heads = self.branches();
+        match (heads.get(&pr.base_ref), heads.get(&pr.head_ref)) {
+            (Some(base), Some(head)) if pr.is_open() => {
+                self.merged_tree(None, base, head).is_none()
+            }
+            _ => false,
+        }
     }
 
     fn graphql_pr_status(&self, number: u64) -> Value {
@@ -616,21 +655,22 @@ impl State {
 
     // -- merging -----------------------------------------------------------
 
-    fn squash_merge(&mut self, number: u64, commit: Option<(String, String)>) -> String {
+    fn squash_merge(&mut self, number: u64, commit: Option<(String, String)>) -> Option<String> {
         self.squash_merge_from(number, None, commit)
     }
 
-    /// Squash-merge `number` into its base. `merge_base` is where its own
-    /// changes start, when that is not the merge base with the base branch
-    /// (a stacked PR whose parent was just squash-merged below it). `commit`
-    /// is the requested title and message; without it the message is the
-    /// fake's own default.
+    /// Squash-merge `number` into its base; `None`, with nothing changed,
+    /// when that conflicts. `merge_base` is where its own changes start,
+    /// when that is not the merge base with the base branch (a stacked PR
+    /// whose parent was just squash-merged below it). `commit` is the
+    /// requested title and message; without it the message is the fake's
+    /// own default.
     fn squash_merge_from(
         &mut self,
         number: u64,
         merge_base: Option<&str>,
         commit: Option<(String, String)>,
-    ) -> String {
+    ) -> Option<String> {
         let heads = self.branches();
         let (base_ref, head_ref, title) = {
             let pr = &self.prs[&number];
@@ -642,52 +682,73 @@ impl State {
             Some((title, body)) => format!("{title}\n\n{body}"),
             None => format!("{title} (#{number})"),
         };
-        let commit = self.merge_tree_commit(merge_base, &base, &head, &[&base], &message, None);
+        let tree = self.merged_tree(merge_base, &base, &head)?;
+        let commit = self.commit_tree(&tree, &[&base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{base_ref}"), &commit]);
         let pr = self.prs.get_mut(&number).unwrap();
         pr.merged_at = Some(now());
         pr.merge_commit_sha = Some(commit.clone());
         pr.last_head_sha = head;
         pr.state = "closed".into();
-        commit
+        Some(commit)
     }
 
-    /// GitHub rebasing a surviving stack member after a merge below it:
-    /// each of the branch's own commits (those not in `old_base`) is
-    /// replayed onto the new base, and merge commits are dropped. A member
-    /// left with no commits gets the new base's head and is closed, as live
-    /// GitHub did with a reordered stack.
-    fn rebase_onto(&mut self, number: u64, old_base: &str, new_base_ref: &str) {
-        let heads = self.branches();
-        let head_ref = self.prs[&number].head_ref.clone();
-        let head = heads[&head_ref].clone();
-        let mut tip = heads[new_base_ref].clone();
+    /// Replay the non-merge commits of `old_base..head` onto `onto`, leaving
+    /// out those that `onto` makes empty. Returns the new tip, which is
+    /// `onto` when no commit is left, or `None` when a commit conflicts.
+    fn replay(&self, head: &str, old_base: &str, onto: &str) -> Option<String> {
         let range = format!("{old_base}..{head}");
         let commits = self.git(&["rev-list", "--reverse", "--no-merges", &range]);
-        if commits.is_empty() {
+        let mut tip = onto.to_string();
+        for commit in commits.lines() {
+            let tree = self.merged_tree(Some(&format!("{commit}^")), &tip, commit)?;
+            if tree == self.tree_of(&tip) {
+                continue;
+            }
+            let message = self.git(&["log", "-1", "--format=%B", commit]);
+            tip = self.commit_tree(&tree, &[&tip], &message, Some(commit));
+        }
+        Some(tip)
+    }
+
+    /// GitHub rebasing stack members, bottom first, after a merge below them
+    /// or a press of the rebase button: the first one's own commits (those
+    /// not in `old_base`) are replayed onto the head of `base_ref`, and each
+    /// later one's onto the new head of the member below. A member left with
+    /// no commits gets its new base's head and is closed, as live GitHub did
+    /// with a reordered stack.
+    ///
+    /// When any replay conflicts, no branch is rewritten and this returns
+    /// false, as live GitHub did after a conflict-resolved update. (Seen
+    /// with the conflict in the first member; that a conflict further up
+    /// also leaves the lower members alone is an assumption.)
+    fn rebase_members(&mut self, members: &[u64], base_ref: &str, old_base: &str) -> bool {
+        let heads = self.branches();
+        let mut plan = Vec::new();
+        let (mut onto, mut old) = (heads[base_ref].clone(), old_base.to_string());
+        for &number in members {
+            let head = heads[&self.prs[&number].head_ref].clone();
+            let Some(tip) = self.replay(&head, &old, &onto) else {
+                return false;
+            };
+            plan.push((number, tip.clone(), tip == onto));
+            (onto, old) = (tip, head);
+        }
+        let mut new_base = base_ref.to_string();
+        for (number, tip, emptied) in plan {
+            let head_ref = self.prs[&number].head_ref.clone();
             self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &tip]);
             let pr = self.prs.get_mut(&number).unwrap();
             pr.last_head_sha = tip;
-            pr.state = "closed".into();
-            pr.closed_reason = Some("no commits left after the stack rebase".into());
-            return;
+            if emptied {
+                pr.state = "closed".into();
+                pr.closed_reason = Some("no commits left after the stack rebase".into());
+            } else {
+                pr.base_ref = new_base;
+            }
+            new_base = head_ref;
         }
-        for commit in commits.lines() {
-            let parent = format!("{commit}^");
-            let message = self.git(&["log", "-1", "--format=%B", commit]);
-            tip = self.merge_tree_commit(
-                Some(&parent),
-                &tip,
-                commit,
-                &[&tip],
-                &message,
-                Some(commit),
-            );
-        }
-        self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &tip]);
-        let pr = self.prs.get_mut(&number).unwrap();
-        pr.base_ref = new_base_ref.to_string();
-        pr.last_head_sha = tip;
+        true
     }
 
     fn complete_stack_merge(&mut self, pr_number: u64) {
@@ -703,18 +764,27 @@ impl State {
         let commit = self.merge_ops[&pr_number].commit.clone();
         for number in &prefix {
             let head = self.branches()[&self.prs[number].head_ref].clone();
-            self.prs.get_mut(number).unwrap().base_ref = base_ref.clone();
+            let old_base = std::mem::replace(
+                &mut self.prs.get_mut(number).unwrap().base_ref,
+                base_ref.clone(),
+            );
             let commit = commit.clone().filter(|_| *number == pr_number);
-            self.squash_merge_from(*number, below.as_deref(), commit);
+            if self
+                .squash_merge_from(*number, below.as_deref(), commit)
+                .is_none()
+            {
+                self.prs.get_mut(number).unwrap().base_ref = old_base;
+                let op = self.merge_ops.get_mut(&pr_number).unwrap();
+                op.status = "failed".into();
+                op.message = format!("Pull request #{number} is not mergeable.");
+                return;
+            }
             below = Some(head);
         }
-        let (mut previous_base, mut previous_old) = (base_ref.clone(), old_top);
-        for number in survivors {
-            let head_ref = self.prs[&number].head_ref.clone();
-            let old_head = self.branches()[&head_ref].clone();
-            self.rebase_onto(number, &previous_old, &previous_base);
-            previous_base = head_ref;
-            previous_old = old_head;
+        if !self.rebase_members(&survivors, &base_ref, &old_top)
+            && let Some(next) = survivors.first()
+        {
+            self.prs.get_mut(next).unwrap().base_ref = base_ref.clone();
         }
         let sha = self.branches()[&base_ref].clone();
         let op = self.merge_ops.get_mut(&pr_number).unwrap();
@@ -744,8 +814,11 @@ impl State {
                 },
             );
             self.complete_stack_merge(number);
+            let status = &self.merge_ops[&number].status;
+            assert_eq!(status, "merged", "fake github: #{number} did not merge");
         } else {
-            self.squash_merge(number, None);
+            self.squash_merge(number, None)
+                .unwrap_or_else(|| panic!("fake github: #{number} is not mergeable"));
         }
     }
 
@@ -758,14 +831,7 @@ impl State {
         let heads = self.branches();
         let bottom_head = heads[&self.prs[&members[0]].head_ref].clone();
         let fork = self.git(&["merge-base", &bottom_head, &heads[&base_ref]]);
-        let (mut previous_base, mut previous_old) = (base_ref, fork);
-        for number in members {
-            let head_ref = self.prs[&number].head_ref.clone();
-            let old_head = self.branches()[&head_ref].clone();
-            self.rebase_onto(number, &previous_old, &previous_base);
-            previous_base = head_ref;
-            previous_old = old_head;
-        }
+        self.rebase_members(&members, &base_ref, &fork);
     }
 
     /// Close a Pull Request without merging it, as in GitHub's web UI.
@@ -798,7 +864,10 @@ impl State {
         };
         let (base, head) = (heads[&base_ref].clone(), heads[&head_ref].clone());
         let message = format!("Merge branch '{base_ref}' into {head_ref}");
-        let commit = self.merge_tree_commit(None, &head, &base, &[&head, &base], &message, None);
+        let tree = self
+            .merged_tree(None, &head, &base)
+            .unwrap_or_else(|| panic!("fake github: #{number} conflicts with {base_ref}"));
+        let commit = self.commit_tree(&tree, &[&head, &base], &message, None);
         self.git(&["update-ref", &format!("refs/heads/{head_ref}"), &commit]);
         self.prs.get_mut(&number).unwrap().last_head_sha = commit;
     }
@@ -909,7 +978,9 @@ impl State {
                 {
                     return api_error(409, "Head branch was modified.");
                 }
-                let sha = self.squash_merge(n, requested_commit(body));
+                let Some(sha) = self.squash_merge(n, requested_commit(body)) else {
+                    return api_error(405, "Pull Request is not mergeable");
+                };
                 Ok((
                     200,
                     Some(json!({"sha": sha, "merged": true,
@@ -998,10 +1069,15 @@ impl State {
             && new_base != base_ref
         {
             if self.stack_of(number).is_some() {
-                return api_error(
-                    422,
-                    "A stacked pull request's base cannot be updated directly.",
-                );
+                return Err(ApiError {
+                    status: 422,
+                    message: "Validation Failed".into(),
+                    errors: vec![json!({
+                        "resource": "PullRequest", "code": "invalid", "field": "base",
+                        "message": "Cannot change the base branch because the pull request \
+                                    is part of a stack.",
+                    })],
+                });
             }
             if state != "open" {
                 return api_error(
@@ -1184,7 +1260,6 @@ impl FakeGitHub {
             merge_ops: HashMap::new(),
             failing_queries: Vec::new(),
             unknown_mergeability_polls: 0,
-            conflicting: Vec::new(),
             requests: Vec::new(),
             next_number: 1,
         }));
@@ -1268,10 +1343,14 @@ async fn handle(
         state.refresh();
         match reply {
             Ok(reply) => reply,
-            Err(error) => (
-                error.status,
-                Some(json!({"message": error.message, "status": error.status.to_string()})),
-            ),
+            Err(error) => {
+                let mut payload =
+                    json!({"message": error.message, "status": error.status.to_string()});
+                if !error.errors.is_empty() {
+                    payload["errors"] = Value::Array(error.errors);
+                }
+                (error.status, Some(payload))
+            }
         }
     })
     .await
