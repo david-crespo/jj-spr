@@ -595,6 +595,31 @@ fn close_keeps_dependents() {
 }
 
 #[test]
+fn close_the_top_pull_request_and_open_a_new_one() {
+    // GitHub keeps the closed Pull Request at the top of the stack, and
+    // chains a Pull Request added to the stack from it, so the stack has to
+    // be rebuilt.
+    let env = TestEnv::new();
+    let changes = env.build_stack(&["a", "b", "c"]);
+    let prs = env.prs_for(&changes);
+    let old: Vec<u64> = env.stacks().into_keys().collect();
+    env.spr(&["close", "-r", &changes[2]]);
+    assert!(!env.pr(prs[2]).is_open());
+
+    let out = env.spr(&["diff", "--all", "-m", "reopen C"]);
+    assert!(!out.text.contains("failed"), "{}", out.text);
+    let now = env.check_chain(&changes);
+    assert_eq!(now[..2], prs[..2]);
+    assert!(!prs.contains(&now[2]), "C gets a new Pull Request");
+    assert_eq!(env.active_stacks(), vec![now]);
+    assert!(
+        env.stacks().keys().all(|stack| !old.contains(stack)),
+        "the old stack is dissolved: {:?}",
+        env.stacks()
+    );
+}
+
+#[test]
 fn stacks_disabled() {
     let env = TestEnv::with_stacks(false);
     let changes = env.build_stack(&["a", "b", "c"]);

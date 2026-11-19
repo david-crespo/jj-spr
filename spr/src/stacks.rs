@@ -150,7 +150,17 @@ pub struct PublishedLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StackAction {
     Create(Vec<u64>),
-    Add { stack: u64, pull_requests: Vec<u64> },
+    Add {
+        stack: u64,
+        pull_requests: Vec<u64>,
+    },
+    /// Dissolve `stack` and create one of `pull_requests`: GitHub chains
+    /// Pull Requests added to a stack from its last member, so nothing can
+    /// be added above a closed one.
+    Rebuild {
+        stack: u64,
+        pull_requests: Vec<u64>,
+    },
     Warn(String),
 }
 
@@ -185,7 +195,16 @@ pub fn plan_stack_updates(stacks: &[GitHubStack], segments: &[Vec<u64>]) -> Vec<
                 let inserted_below_top = active.contains(&segment[0])
                     && active.last() != Some(&segment[0])
                     && segment[1..].iter().all(|n| !active.contains(n));
+                let ends_closed = stack.pull_requests.last().is_some_and(|pr| !pr.is_active());
                 match overlap {
+                    Some(k) if ends_closed => actions.push(StackAction::Rebuild {
+                        stack: stack.number,
+                        pull_requests: active[..active.len() - k]
+                            .iter()
+                            .chain(segment)
+                            .copied()
+                            .collect(),
+                    }),
                     Some(k) => actions.push(StackAction::Add {
                         stack: stack.number,
                         pull_requests: segment[k..].to_vec(),
@@ -330,7 +349,9 @@ impl Finding {
             Finding::Closed { .. } => "closed",
             Finding::WrongBase { .. } => "wrong_base",
             Finding::Stack(StackAction::Create(_)) => "stack_missing",
-            Finding::Stack(StackAction::Add { .. }) => "stack_incomplete",
+            Finding::Stack(StackAction::Add { .. } | StackAction::Rebuild { .. }) => {
+                "stack_incomplete"
+            }
             Finding::Stack(StackAction::Warn(_)) => "stack_mismatch",
             Finding::StacksUnavailable => "stacks_unavailable",
         }
@@ -415,6 +436,14 @@ impl Finding {
                 } else {
                     "are"
                 }
+            ),
+            Finding::Stack(StackAction::Rebuild {
+                stack,
+                pull_requests,
+            }) => format!(
+                "GitHub stack #{stack} ends with a closed Pull Request, so it has to be \
+                 rebuilt as {}. Run `jj spr diff --all`.",
+                format_pr_list(pull_requests)
             ),
             Finding::Stack(StackAction::Warn(message)) => message.clone(),
             Finding::StacksUnavailable => "Stacked pull requests are not enabled for this \
@@ -822,6 +851,19 @@ mod tests {
             vec![StackAction::Add {
                 stack: 9,
                 pull_requests: vec![3, 4]
+            }]
+        );
+    }
+
+    #[test]
+    fn rebuilds_a_stack_that_ends_with_a_closed_pull_request() {
+        let mut stacks = [stack(9, &[(1, true), (2, false), (3, false), (4, false)])];
+        stacks[0].pull_requests[3].state = Some("closed".to_string());
+        assert_eq!(
+            plan_stack_updates(&stacks, &[vec![3, 5]]),
+            vec![StackAction::Rebuild {
+                stack: 9,
+                pull_requests: vec![2, 3, 5]
             }]
         );
     }

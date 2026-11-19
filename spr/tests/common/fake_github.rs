@@ -586,7 +586,9 @@ impl State {
         if added.is_empty() {
             return api_error(422, "No pull requests to append.");
         }
-        let mut chained = self.active(&existing);
+        // GitHub chains the added Pull Requests from the stack's last
+        // member, even a closed one (seen live, not by the live script).
+        let mut chained: Vec<u64> = existing.last().copied().into_iter().collect();
         chained.extend(&added);
         self.validate_stack(&added, &chained, Some(number))?;
         let mut members = existing;

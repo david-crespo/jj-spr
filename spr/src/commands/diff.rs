@@ -951,6 +951,38 @@ async fn register_native_stacks(
                     }
                 }
             },
+            StackAction::Rebuild {
+                stack,
+                pull_requests,
+            } => {
+                output(
+                    "🧱",
+                    &format!(
+                        "Dissolving GitHub stack #{stack}, which ends with a closed Pull \
+                         Request, to rebuild it"
+                    ),
+                )?;
+                let rebuilt = async {
+                    gh.unstack(stack).await?;
+                    gh.create_stack(&pull_requests).await
+                };
+                match rebuilt.await {
+                    Ok(new) => output(
+                        "🧱",
+                        &format!(
+                            "Created GitHub stack #{}: {}",
+                            new.number,
+                            format_pr_list(&pull_requests)
+                        ),
+                    )?,
+                    Err(error) => {
+                        output("⚠️", "Rebuilding the GitHub stack failed")?;
+                        for message in error.messages() {
+                            output("  ", message)?;
+                        }
+                    }
+                }
+            }
             StackAction::Warn(message) => output("⚠️", &message)?,
         }
     }
